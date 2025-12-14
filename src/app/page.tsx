@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 
 interface LatestTableRow {
   id: string;
@@ -31,6 +31,55 @@ interface AnalyzeData {
   latestTable: LatestTableRow[];
 }
 
+interface HistorySnapshot {
+  id: string;
+  createdAt: string;
+  asOf: string;
+  profile: string;
+  regime: {
+    risk: string;
+    conditions: string;
+  };
+  features: {
+    slope10y2y: number | null;
+  };
+}
+
+interface HistoryDetail {
+  id: string;
+  createdAt: string;
+  profile: string;
+  asOf: string;
+  regime: {
+    risk: string;
+    conditions: string;
+    explanation: string;
+  };
+  features: {
+    slope10y2y: number | null;
+  };
+  latest: {
+    dgs10: number | null;
+    dgs2: number | null;
+    cpi: number | null;
+    hy: number | null;
+    vix: number | null;
+  };
+  chg20d: {
+    dgs10: number | null;
+    dgs2: number | null;
+    cpi: number | null;
+    hy: number | null;
+    vix: number | null;
+  };
+}
+
+interface HistoryResponse {
+  count: number;
+  limit: number;
+  snapshots: HistorySnapshot[];
+}
+
 interface ErrorData {
   error: string;
   message: string;
@@ -38,11 +87,19 @@ interface ErrorData {
 }
 
 type Status = "idle" | "loading" | "success" | "error";
+type HistoryStatus = "idle" | "loading" | "success" | "error";
 
 export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [data, setData] = useState<AnalyzeData | null>(null);
   const [error, setError] = useState<ErrorData | null>(null);
+
+  // History state
+  const [historyStatus, setHistoryStatus] = useState<HistoryStatus>("idle");
+  const [history, setHistory] = useState<HistorySnapshot[]>([]);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [selectedSnapshot, setSelectedSnapshot] = useState<HistoryDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   const runAnalysis = useCallback(async () => {
     setStatus("loading");
@@ -60,6 +117,9 @@ export default function Home() {
 
       setData(result as AnalyzeData);
       setStatus("success");
+      
+      // Uppdatera historik efter lyckad analys
+      fetchHistory();
     } catch (err) {
       setError({
         error: "Nätverksfel",
@@ -68,6 +128,52 @@ export default function Home() {
       setStatus("error");
     }
   }, []);
+
+  const fetchHistory = useCallback(async () => {
+    setHistoryStatus("loading");
+    setHistoryError(null);
+
+    try {
+      const response = await fetch("/api/macro/history?limit=10");
+      const result = await response.json();
+
+      if (!response.ok) {
+        setHistoryError(result.message || "Kunde inte hämta historik");
+        setHistoryStatus("error");
+        return;
+      }
+
+      setHistory((result as HistoryResponse).snapshots || []);
+      setHistoryStatus("success");
+    } catch (err) {
+      setHistoryError(err instanceof Error ? err.message : "Kunde inte hämta historik");
+      setHistoryStatus("error");
+    }
+  }, []);
+
+  const fetchSnapshotDetail = useCallback(async (id: string) => {
+    setDetailLoading(true);
+    try {
+      const response = await fetch(`/api/macro/history/${id}`);
+      const result = await response.json();
+
+      if (!response.ok) {
+        console.error("Could not fetch snapshot:", result);
+        return;
+      }
+
+      setSelectedSnapshot(result as HistoryDetail);
+    } catch (err) {
+      console.error("Error fetching snapshot:", err);
+    } finally {
+      setDetailLoading(false);
+    }
+  }, []);
+
+  // Hämta historik vid sidladdning
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
 
   const formatValue = (value: number | null, decimals: number = 2): string => {
     if (value === null) return "—";
@@ -85,6 +191,47 @@ export default function Home() {
     if (value > 0) return "var(--accent-red)";
     if (value < 0) return "var(--accent-green)";
     return "var(--text-secondary)";
+  };
+
+  const formatDateTime = (isoString: string): string => {
+    try {
+      const date = new Date(isoString);
+      return date.toLocaleString("sv-SE", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch {
+      return isoString;
+    }
+  };
+
+  const getRiskColor = (risk: string): string => {
+    switch (risk) {
+      case "risk_off":
+        return "var(--accent-red)";
+      case "tightening":
+        return "var(--accent-orange)";
+      case "risk_on":
+        return "var(--accent-green)";
+      default:
+        return "var(--text-muted)";
+    }
+  };
+
+  const getRiskLabel = (risk: string): string => {
+    switch (risk) {
+      case "risk_off":
+        return "RISK OFF";
+      case "tightening":
+        return "TIGHTENING";
+      case "risk_on":
+        return "RISK ON";
+      default:
+        return "NEUTRAL";
+    }
   };
 
   return (
@@ -276,6 +423,179 @@ export default function Home() {
           </div>
         )}
 
+        {/* History Section */}
+        <section style={styles.historySection}>
+          <div style={styles.historyHeader}>
+            <h2 style={styles.sectionTitle}>Historik</h2>
+            <button
+              onClick={fetchHistory}
+              style={styles.refreshButton}
+              disabled={historyStatus === "loading"}
+            >
+              {historyStatus === "loading" ? "Laddar..." : "↻ Uppdatera"}
+            </button>
+          </div>
+
+          {historyStatus === "error" && historyError && (
+            <div style={styles.historyError}>
+              <span>⚠ {historyError}</span>
+            </div>
+          )}
+
+          {historyStatus === "success" && history.length === 0 && (
+            <div style={styles.historyEmpty}>
+              <p>Ingen historik ännu. Kör en analys för att spara första snapshot.</p>
+            </div>
+          )}
+
+          {history.length > 0 && (
+            <div style={styles.historyList}>
+              {history.map((snapshot) => (
+                <div
+                  key={snapshot.id}
+                  style={{
+                    ...styles.historyItem,
+                    ...(selectedSnapshot?.id === snapshot.id ? styles.historyItemSelected : {}),
+                  }}
+                  onClick={() => fetchSnapshotDetail(snapshot.id)}
+                >
+                  <div style={styles.historyItemHeader}>
+                    <span
+                      style={{
+                        ...styles.historyRiskBadge,
+                        backgroundColor: getRiskColor(snapshot.regime.risk),
+                      }}
+                    >
+                      {getRiskLabel(snapshot.regime.risk)}
+                    </span>
+                    <span style={styles.historyDate}>
+                      {formatDateTime(snapshot.createdAt)}
+                    </span>
+                  </div>
+                  <div style={styles.historyItemBody}>
+                    <span style={styles.historySlope}>
+                      Slope: {formatValue(snapshot.features.slope10y2y)}%
+                    </span>
+                    {snapshot.regime.conditions && (
+                      <span style={styles.historyConditions}>
+                        {snapshot.regime.conditions}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Snapshot Detail Modal */}
+          {selectedSnapshot && (
+            <div style={styles.detailOverlay} onClick={() => setSelectedSnapshot(null)}>
+              <div style={styles.detailModal} onClick={(e) => e.stopPropagation()}>
+                <div style={styles.detailHeader}>
+                  <h3 style={styles.detailTitle}>Snapshot Detaljer</h3>
+                  <button
+                    style={styles.detailClose}
+                    onClick={() => setSelectedSnapshot(null)}
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                {detailLoading ? (
+                  <div style={styles.detailLoading}>Laddar...</div>
+                ) : (
+                  <div style={styles.detailContent}>
+                    <div style={styles.detailRow}>
+                      <span style={styles.detailLabel}>Skapad</span>
+                      <span>{formatDateTime(selectedSnapshot.createdAt)}</span>
+                    </div>
+                    <div style={styles.detailRow}>
+                      <span style={styles.detailLabel}>As Of</span>
+                      <span>{selectedSnapshot.asOf}</span>
+                    </div>
+                    <div style={styles.detailRow}>
+                      <span style={styles.detailLabel}>Regime</span>
+                      <span style={{ color: getRiskColor(selectedSnapshot.regime.risk) }}>
+                        {getRiskLabel(selectedSnapshot.regime.risk)}
+                      </span>
+                    </div>
+                    <div style={styles.detailRow}>
+                      <span style={styles.detailLabel}>Slope 10Y-2Y</span>
+                      <span>{formatValue(selectedSnapshot.features.slope10y2y)}%</span>
+                    </div>
+
+                    <div style={styles.detailDivider}></div>
+
+                    <p style={styles.detailExplanation}>
+                      {selectedSnapshot.regime.explanation}
+                    </p>
+
+                    <div style={styles.detailDivider}></div>
+
+                    <h4 style={styles.detailSubtitle}>Senaste värden</h4>
+                    <div style={styles.detailGrid}>
+                      <div style={styles.detailGridItem}>
+                        <span style={styles.detailGridLabel}>10Y</span>
+                        <span>{formatValue(selectedSnapshot.latest.dgs10)}%</span>
+                      </div>
+                      <div style={styles.detailGridItem}>
+                        <span style={styles.detailGridLabel}>2Y</span>
+                        <span>{formatValue(selectedSnapshot.latest.dgs2)}%</span>
+                      </div>
+                      <div style={styles.detailGridItem}>
+                        <span style={styles.detailGridLabel}>CPI</span>
+                        <span>{formatValue(selectedSnapshot.latest.cpi)}</span>
+                      </div>
+                      <div style={styles.detailGridItem}>
+                        <span style={styles.detailGridLabel}>HY</span>
+                        <span>{formatValue(selectedSnapshot.latest.hy)}%</span>
+                      </div>
+                      <div style={styles.detailGridItem}>
+                        <span style={styles.detailGridLabel}>VIX</span>
+                        <span>{formatValue(selectedSnapshot.latest.vix)}</span>
+                      </div>
+                    </div>
+
+                    <h4 style={styles.detailSubtitle}>20-dagars förändring</h4>
+                    <div style={styles.detailGrid}>
+                      <div style={styles.detailGridItem}>
+                        <span style={styles.detailGridLabel}>10Y</span>
+                        <span style={{ color: getChangeColor(selectedSnapshot.chg20d.dgs10) }}>
+                          {formatChange(selectedSnapshot.chg20d.dgs10)}
+                        </span>
+                      </div>
+                      <div style={styles.detailGridItem}>
+                        <span style={styles.detailGridLabel}>2Y</span>
+                        <span style={{ color: getChangeColor(selectedSnapshot.chg20d.dgs2) }}>
+                          {formatChange(selectedSnapshot.chg20d.dgs2)}
+                        </span>
+                      </div>
+                      <div style={styles.detailGridItem}>
+                        <span style={styles.detailGridLabel}>CPI</span>
+                        <span style={{ color: getChangeColor(selectedSnapshot.chg20d.cpi) }}>
+                          {formatChange(selectedSnapshot.chg20d.cpi)}
+                        </span>
+                      </div>
+                      <div style={styles.detailGridItem}>
+                        <span style={styles.detailGridLabel}>HY</span>
+                        <span style={{ color: getChangeColor(selectedSnapshot.chg20d.hy) }}>
+                          {formatChange(selectedSnapshot.chg20d.hy)}
+                        </span>
+                      </div>
+                      <div style={styles.detailGridItem}>
+                        <span style={styles.detailGridLabel}>VIX</span>
+                        <span style={{ color: getChangeColor(selectedSnapshot.chg20d.vix) }}>
+                          {formatChange(selectedSnapshot.chg20d.vix)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+
         {/* Footer */}
         <footer style={styles.footer}>
           <p>
@@ -287,7 +607,7 @@ export default function Home() {
             >
               FRED API
             </a>{" "}
-            | Cache TTL: 15 min
+            | Historik: Firebase Firestore | Cache TTL: 15 min
           </p>
         </footer>
       </div>
@@ -588,6 +908,196 @@ const styles: Record<string, React.CSSProperties> = {
     margin: "0 auto",
     lineHeight: 1.6,
   },
+
+  // History styles
+  historySection: {
+    marginTop: "2rem",
+    paddingTop: "2rem",
+    borderTop: "1px solid var(--border-color)",
+  },
+  historyHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: "1rem",
+  },
+  refreshButton: {
+    padding: "0.5rem 1rem",
+    fontSize: "0.8rem",
+    fontFamily: "inherit",
+    color: "var(--text-secondary)",
+    backgroundColor: "var(--bg-tertiary)",
+    border: "1px solid var(--border-color)",
+    borderRadius: "6px",
+    cursor: "pointer",
+    transition: "all 0.2s ease",
+  },
+  historyError: {
+    padding: "1rem",
+    backgroundColor: "rgba(239, 68, 68, 0.1)",
+    border: "1px solid rgba(239, 68, 68, 0.3)",
+    borderRadius: "8px",
+    color: "var(--accent-red)",
+    fontSize: "0.85rem",
+  },
+  historyEmpty: {
+    padding: "2rem",
+    textAlign: "center",
+    backgroundColor: "var(--bg-secondary)",
+    border: "1px dashed var(--border-color)",
+    borderRadius: "8px",
+    color: "var(--text-muted)",
+    fontSize: "0.9rem",
+  },
+  historyList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.75rem",
+  },
+  historyItem: {
+    padding: "1rem",
+    backgroundColor: "var(--bg-secondary)",
+    border: "1px solid var(--border-color)",
+    borderRadius: "8px",
+    cursor: "pointer",
+    transition: "all 0.2s ease",
+  },
+  historyItemSelected: {
+    borderColor: "var(--accent-blue)",
+    boxShadow: "0 0 0 1px var(--accent-blue)",
+  },
+  historyItemHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: "0.5rem",
+  },
+  historyRiskBadge: {
+    padding: "0.25rem 0.5rem",
+    fontSize: "0.7rem",
+    fontWeight: 600,
+    color: "white",
+    borderRadius: "4px",
+    letterSpacing: "0.03em",
+  },
+  historyDate: {
+    fontSize: "0.75rem",
+    color: "var(--text-muted)",
+    fontFamily: "'JetBrains Mono', monospace",
+  },
+  historyItemBody: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.25rem",
+  },
+  historySlope: {
+    fontSize: "0.85rem",
+    color: "var(--text-primary)",
+  },
+  historyConditions: {
+    fontSize: "0.75rem",
+    color: "var(--text-muted)",
+  },
+
+  // Detail Modal styles
+  detailOverlay: {
+    position: "fixed",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "rgba(0, 0, 0, 0.7)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 1000,
+    padding: "1rem",
+  },
+  detailModal: {
+    backgroundColor: "var(--bg-secondary)",
+    border: "1px solid var(--border-color)",
+    borderRadius: "12px",
+    maxWidth: "500px",
+    width: "100%",
+    maxHeight: "80vh",
+    overflow: "auto",
+  },
+  detailHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "1rem 1.25rem",
+    borderBottom: "1px solid var(--border-color)",
+  },
+  detailTitle: {
+    fontSize: "1rem",
+    fontWeight: 600,
+    color: "var(--text-primary)",
+  },
+  detailClose: {
+    padding: "0.25rem 0.5rem",
+    fontSize: "1rem",
+    color: "var(--text-muted)",
+    backgroundColor: "transparent",
+    border: "none",
+    cursor: "pointer",
+  },
+  detailLoading: {
+    padding: "2rem",
+    textAlign: "center",
+    color: "var(--text-muted)",
+  },
+  detailContent: {
+    padding: "1.25rem",
+  },
+  detailRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    marginBottom: "0.75rem",
+    fontSize: "0.9rem",
+  },
+  detailLabel: {
+    color: "var(--text-muted)",
+  },
+  detailDivider: {
+    height: "1px",
+    backgroundColor: "var(--border-color)",
+    margin: "1rem 0",
+  },
+  detailExplanation: {
+    fontSize: "0.85rem",
+    color: "var(--text-secondary)",
+    lineHeight: 1.6,
+  },
+  detailSubtitle: {
+    fontSize: "0.8rem",
+    fontWeight: 600,
+    color: "var(--text-muted)",
+    marginBottom: "0.75rem",
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+  },
+  detailGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(3, 1fr)",
+    gap: "0.75rem",
+    marginBottom: "1rem",
+  },
+  detailGridItem: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.25rem",
+    padding: "0.5rem",
+    backgroundColor: "var(--bg-tertiary)",
+    borderRadius: "6px",
+    textAlign: "center",
+  },
+  detailGridLabel: {
+    fontSize: "0.7rem",
+    color: "var(--text-muted)",
+    textTransform: "uppercase",
+  },
+
   footer: {
     marginTop: "3rem",
     paddingTop: "1.5rem",
@@ -608,4 +1118,3 @@ if (typeof document !== "undefined") {
   `;
   document.head.appendChild(styleSheet);
 }
-

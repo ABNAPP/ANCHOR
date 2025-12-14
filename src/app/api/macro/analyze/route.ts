@@ -1,8 +1,11 @@
 import { NextResponse } from "next/server";
+import { FieldValue } from "firebase-admin/firestore";
 import { MVP_CONFIG } from "@/config/mvp";
 import { fetchMultipleFredSeries } from "@/lib/fred/client";
 import { calculateFeatures } from "@/lib/macro/features";
 import { detectRegime, getRiskLabel, getRiskColor } from "@/lib/macro/regime";
+import { getFirestoreDb, MACRO_SNAPSHOTS_COLLECTION } from "@/lib/firebase/admin";
+import { MacroSnapshot } from "@/lib/firebase/types";
 
 // In-memory cache för analyze-responsen
 interface CacheEntry {
@@ -69,6 +72,55 @@ function setCache(key: string, data: AnalyzeResponse): void {
     data,
     timestamp: Date.now(),
   });
+}
+
+/**
+ * Sparar en snapshot till Firestore
+ * Returnerar true om lyckat, false om misslyckat
+ */
+async function saveSnapshotToFirestore(response: AnalyzeResponse): Promise<boolean> {
+  try {
+    const db = getFirestoreDb();
+    if (!db) {
+      console.warn("Firestore inte konfigurerat - hoppar över snapshot-sparning");
+      return false;
+    }
+
+    const snapshot: MacroSnapshot = {
+      createdAt: FieldValue.serverTimestamp(),
+      profile: response.profile,
+      asOf: response.asOf,
+      regime: {
+        risk: response.regime.risk,
+        conditions: response.regime.conditions.join(", "),
+        explanation: response.regime.explanation,
+      },
+      features: {
+        slope10y2y: response.features.slope10y2y,
+      },
+      latest: {
+        dgs10: response.features.latest["DGS10"] ?? null,
+        dgs2: response.features.latest["DGS2"] ?? null,
+        cpi: response.features.latest["CPIAUCSL"] ?? null,
+        hy: response.features.latest["BAMLH0A0HYM2"] ?? null,
+        vix: response.features.latest["VIXCLS"] ?? null,
+      },
+      chg20d: {
+        dgs10: response.features.chg20d["DGS10"] ?? null,
+        dgs2: response.features.chg20d["DGS2"] ?? null,
+        cpi: response.features.chg20d["CPIAUCSL"] ?? null,
+        hy: response.features.chg20d["BAMLH0A0HYM2"] ?? null,
+        vix: response.features.chg20d["VIXCLS"] ?? null,
+      },
+    };
+
+    await db.collection(MACRO_SNAPSHOTS_COLLECTION).add(snapshot);
+    console.log("Snapshot sparad till Firestore");
+    return true;
+  } catch (error) {
+    console.error("Kunde inte spara snapshot till Firestore:", error);
+    return false;
+  }
 }
 
 export async function GET(): Promise<NextResponse> {
@@ -159,6 +211,12 @@ export async function GET(): Promise<NextResponse> {
     // Spara i cache
     setCache(cacheKey, response);
 
+    // Spara snapshot till Firestore (icke-blockerande)
+    // Om det misslyckas loggas felet men användaren får ändå sitt svar
+    saveSnapshotToFirestore(response).catch((err) => {
+      console.error("Firestore save failed:", err);
+    });
+
     return NextResponse.json({
       ...response,
       cached: false,
@@ -178,4 +236,3 @@ export async function GET(): Promise<NextResponse> {
     );
   }
 }
-

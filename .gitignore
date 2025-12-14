@@ -34,3 +34,11 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
+# Firebase Service Account (ALDRIG committa dessa!)
+*serviceAccount*.json
+/serviceAccount*.json
+firebase-adminsdk*.json
+*-firebase-adminsdk-*.json
+
+# Data folder
+/data
