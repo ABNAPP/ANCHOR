@@ -18,6 +18,7 @@ export interface LatestTableRow {
   name: string;
   unit: string;
   latest: number | null;
+  latestDate: string | null;
   chg20d: number | null;
 }
 
@@ -34,6 +35,7 @@ export interface AnalyzeResponse {
   features: {
     slope10y2y: number | null;
     latest: Record<string, number | null>;
+    latestDates: Record<string, string | null>;
     chg20d: Record<string, number | null>;
   };
   latestTable: LatestTableRow[];
@@ -130,6 +132,7 @@ export async function GET(): Promise<NextResponse> {
       name: config.name,
       unit: config.unit,
       latest: features.latest[config.id] ?? null,
+      latestDate: features.latestDates[config.id] ?? null,
       chg20d: features.chg20d[config.id] ?? null,
     }));
 
@@ -147,6 +150,7 @@ export async function GET(): Promise<NextResponse> {
       features: {
         slope10y2y: features.slope10y2y,
         latest: features.latest,
+        latestDates: features.latestDates,
         chg20d: features.chg20d,
       },
       latestTable,

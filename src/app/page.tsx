@@ -7,6 +7,7 @@ interface LatestTableRow {
   name: string;
   unit: string;
   latest: number | null;
+  latestDate: string | null;
   chg20d: number | null;
 }
 
@@ -24,6 +25,7 @@ interface AnalyzeData {
   features: {
     slope10y2y: number | null;
     latest: Record<string, number | null>;
+    latestDates: Record<string, string | null>;
     chg20d: Record<string, number | null>;
   };
   latestTable: LatestTableRow[];
@@ -203,10 +205,6 @@ export default function Home() {
                   )}
               </div>
               <div style={styles.metricCard}>
-                <span style={styles.metricLabel}>Data as of</span>
-                <span style={styles.metricValueSmall}>{data.asOf}</span>
-              </div>
-              <div style={styles.metricCard}>
                 <span style={styles.metricLabel}>Profil</span>
                 <span style={styles.metricValueSmall}>{data.profile}</span>
               </div>
@@ -221,6 +219,7 @@ export default function Home() {
                     <tr>
                       <th style={styles.th}>Serie</th>
                       <th style={styles.thRight}>Senaste</th>
+                      <th style={styles.thRight}>Datum</th>
                       <th style={styles.thRight}>Δ 20d</th>
                     </tr>
                   </thead>
@@ -245,6 +244,9 @@ export default function Home() {
                             {formatValue(row.latest)}
                             <span style={styles.unit}>{row.unit}</span>
                           </span>
+                        </td>
+                        <td style={{ ...styles.tdRight, ...styles.dateValue }}>
+                          {row.latestDate || "—"}
                         </td>
                         <td
                           style={{
@@ -560,6 +562,11 @@ const styles: Record<string, React.CSSProperties> = {
   unit: {
     fontSize: "0.7rem",
     color: "var(--text-muted)",
+  },
+  dateValue: {
+    fontSize: "0.8rem",
+    color: "var(--text-muted)",
+    fontFamily: "'JetBrains Mono', monospace",
   },
   idleState: {
     textAlign: "center",

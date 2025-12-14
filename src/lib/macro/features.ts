@@ -8,6 +8,7 @@ import {
 export interface MacroFeatures {
   asOf: string;
   latest: Record<string, number | null>;
+  latestDates: Record<string, string | null>;
   chg20d: Record<string, number | null>;
   slope10y2y: number | null;
 }
@@ -24,12 +25,14 @@ export function calculateFeatures(
   seriesMap: Map<string, FredSeriesResult>
 ): MacroFeatures {
   const latest: Record<string, number | null> = {};
+  const latestDates: Record<string, string | null> = {};
   const chg20d: Record<string, number | null> = {};
 
   // Beräkna senaste värden och 20-dagars förändring för varje serie
   for (const [seriesId, series] of seriesMap.entries()) {
     const latestVal = getLatestValidValue(series.observations);
     latest[seriesId] = latestVal?.value ?? null;
+    latestDates[seriesId] = latestVal?.date ?? null;
 
     // Beräkna 20-dagars förändring (20 datapunkter med giltiga värden)
     chg20d[seriesId] = calculateChangeFromNBack(series.observations, 20);
@@ -61,6 +64,7 @@ export function calculateFeatures(
   return {
     asOf: asOf || new Date().toISOString().split("T")[0],
     latest,
+    latestDates,
     chg20d,
     slope10y2y,
   };
