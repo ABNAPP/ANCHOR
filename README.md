@@ -32,11 +32,20 @@ npm install
 
 ### 2. Konfigurera miljövariabler
 
-Skapa en fil `.env.local` i projektets rotmapp:
+Kopiera `env.example` till `.env.local` och fyll i dina värden:
+
+```bash
+cp env.example .env.local
+```
+
+Eller skapa `.env.local` manuellt i projektets rotmapp:
 
 ```bash
 # FRED API (obligatorisk)
 FRED_API_KEY=din_fred_api_nyckel_här
+
+# SEC/EDGAR API (rekommenderad)
+SEC_USER_AGENT=ANCHOR (ABNAPP) din-email@domän.com
 
 # Firebase (valfritt - för historik)
 FIREBASE_PROJECT_ID=ditt-projekt-id
@@ -44,7 +53,7 @@ FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@ditt-projekt.iam.gserviceaccount.c
 FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nDIN_PRIVATE_KEY_HÄR\n-----END PRIVATE KEY-----\n"
 ```
 
-> **Hämta API-nyckel:** Registrera dig gratis på [FRED API](https://fred.stlouisfed.org/docs/api/api_key.html)
+> **FRED API-nyckel:** Registrera dig gratis på [FRED API](https://fred.stlouisfed.org/docs/api/api_key.html)
 
 ### 3. Starta utvecklingsserver
 
@@ -223,9 +232,51 @@ Collection: macro_snapshots
 
 ---
 
+## 📡 SEC/EDGAR User-Agent
+
+SEC kräver att alla API-anrop till `sec.gov` och `data.sec.gov` har en User-Agent header med kontaktinformation.
+
+### Konfigurera SEC_USER_AGENT
+
+Miljövariabeln `SEC_USER_AGENT` ska innehålla:
+- Appnamn
+- Version eller identifierare
+- Kontaktmail
+
+**Format:**
+```bash
+SEC_USER_AGENT="ANCHOR (ABNAPP) din-email@domän.com"
+```
+
+### Var du sätter den
+
+| Miljö | Plats |
+|-------|-------|
+| **Lokalt** | `.env.local` i projektrot |
+| **Vercel** | Project Settings → Environment Variables |
+
+### Fallback
+
+Om `SEC_USER_AGENT` saknas använder systemet en fallback och loggar en varning:
+
+```
+[SEC] SEC_USER_AGENT saknas. Använder fallback. Sätt SEC_USER_AGENT i .env.local och i Vercel env.
+```
+
+**Viktigt:** SEC kan blockera anrop utan korrekt User-Agent. Konfigurera alltid denna variabel för produktionsbruk.
+
+### SEC API-moduler
+
+Projektet innehåller SEC-stöd i:
+- `src/lib/sec/config.ts` - User-Agent hantering och API-konfiguration
+- `src/lib/sec/client.ts` - SEC EDGAR API-klient
+
+---
+
 ## 🔒 Säkerhet
 
 - **FRED_API_KEY** läses endast server-side från `process.env`
+- **SEC_USER_AGENT** läses endast server-side (aldrig exponerad till klient)
 - **Firebase Admin SDK** körs endast server-side
 - Ingen API-nyckel eller Firebase-credentials exponeras till klienten
 - Alla API-anrop sker via server-side routes
@@ -281,6 +332,7 @@ I Vercel Dashboard:
 | Name | Value | Environment |
 |------|-------|-------------|
 | `FRED_API_KEY` | din_fred_api_nyckel | All |
+| `SEC_USER_AGENT` | ANCHOR (ABNAPP) din-email@domän.com | All |
 | `FIREBASE_PROJECT_ID` | ditt-projekt-id | All |
 | `FIREBASE_CLIENT_EMAIL` | firebase-adminsdk@... | All |
 | `FIREBASE_PRIVATE_KEY` | -----BEGIN PRIVATE KEY-----... | All |
@@ -384,11 +436,15 @@ Vercel kommer automatiskt bygga och deploya vid varje push till `main`.
 │       │   └── types.ts                # Firestore-typer
 │       ├── fred/
 │       │   └── client.ts               # FRED API-klient
-│       └── macro/
-│           ├── align.ts                # Data-alignment
-│           ├── features.ts             # Feature-beräkningar
-│           └── regime.ts               # Regime-detektion
+│       ├── macro/
+│       │   ├── align.ts                # Data-alignment
+│       │   ├── features.ts             # Feature-beräkningar
+│       │   └── regime.ts               # Regime-detektion
+│       └── sec/
+│           ├── config.ts               # SEC User-Agent config
+│           └── client.ts               # SEC EDGAR API-klient
 ├── .gitignore
+├── env.example                         # Miljövariabel-mall
 ├── next.config.js
 ├── package.json
 ├── README.md
