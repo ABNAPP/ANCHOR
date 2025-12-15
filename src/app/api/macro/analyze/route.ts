@@ -76,14 +76,14 @@ function setCache(key: string, data: AnalyzeResponse): void {
 
 /**
  * Sparar en snapshot till Firestore
- * Returnerar true om lyckat, false om misslyckat
+ * Returnerar document ID om lyckat, null om misslyckat
  */
-async function saveSnapshotToFirestore(response: AnalyzeResponse): Promise<boolean> {
+async function saveSnapshotToFirestore(response: AnalyzeResponse): Promise<string | null> {
   try {
     const db = getFirestoreDb();
     if (!db) {
-      console.warn("Firestore inte konfigurerat - hoppar över snapshot-sparning");
-      return false;
+      console.warn("[Firestore] Inte konfigurerat - hoppar över snapshot-sparning");
+      return null;
     }
 
     const snapshot: MacroSnapshot = {
@@ -114,12 +114,88 @@ async function saveSnapshotToFirestore(response: AnalyzeResponse): Promise<boole
       },
     };
 
-    await db.collection(MACRO_SNAPSHOTS_COLLECTION).add(snapshot);
-    console.log("Snapshot sparad till Firestore");
-    return true;
+    const docRef = await db.collection(MACRO_SNAPSHOTS_COLLECTION).add(snapshot);
+    console.log(`[Firestore] Snapshot saved: ${docRef.id}`);
+    return docRef.id;
   } catch (error) {
-    console.error("Kunde inte spara snapshot till Firestore:", error);
-    return false;
+    console.error("[Firestore] Kunde inte spara snapshot:", error);
+    return null;
+  }
+}
+
+/**
+ * Rensar gamla snapshots för att hålla databasen inom retention-limit.
+ * Använder batch writes för effektivitet.
+ * Raderar max maxDeletesPerRun dokument per körning.
+ */
+async function cleanupOldSnapshots(): Promise<void> {
+  try {
+    const db = getFirestoreDb();
+    if (!db) {
+      return;
+    }
+
+    const { retentionLimit, maxDeletesPerRun } = MVP_CONFIG.firestore;
+
+    // Hämta totalt antal dokument
+    const countSnapshot = await db
+      .collection(MACRO_SNAPSHOTS_COLLECTION)
+      .count()
+      .get();
+    
+    const totalCount = countSnapshot.data().count;
+    
+    // Om vi är inom limit, ingen cleanup behövs
+    if (totalCount <= retentionLimit) {
+      return;
+    }
+
+    const toDelete = Math.min(totalCount - retentionLimit, maxDeletesPerRun);
+    
+    if (toDelete <= 0) {
+      return;
+    }
+
+    console.log(`[Firestore] Retention cleanup: ${totalCount} snapshots, behåller ${retentionLimit}, raderar ${toDelete}`);
+
+    // Hämta de äldsta dokumenten (sorterade efter createdAt ascending = äldst först)
+    const oldDocsSnapshot = await db
+      .collection(MACRO_SNAPSHOTS_COLLECTION)
+      .orderBy("createdAt", "asc")
+      .limit(toDelete)
+      .get();
+
+    if (oldDocsSnapshot.empty) {
+      return;
+    }
+
+    // Använd batch för effektiv radering
+    const batch = db.batch();
+    let deleteCount = 0;
+
+    for (const doc of oldDocsSnapshot.docs) {
+      batch.delete(doc.ref);
+      deleteCount++;
+    }
+
+    await batch.commit();
+    console.log(`[Firestore] Retention cleanup: deleted ${deleteCount} old snapshots`);
+
+  } catch (error) {
+    // Cleanup-fel ska inte blockera användaren
+    console.error("[Firestore] Retention cleanup failed:", error);
+  }
+}
+
+/**
+ * Sparar snapshot och kör retention cleanup (icke-blockerande)
+ */
+async function saveAndCleanup(response: AnalyzeResponse): Promise<void> {
+  const docId = await saveSnapshotToFirestore(response);
+  
+  if (docId) {
+    // Kör cleanup endast om snapshot sparades
+    await cleanupOldSnapshots();
   }
 }
 
@@ -146,6 +222,11 @@ export async function GET(): Promise<NextResponse> {
     // Försök hämta från cache
     const cachedData = getFromCache(cacheKey);
     if (cachedData) {
+      // ÄVEN vid cache-hit, spara snapshot till Firestore (logg)
+      saveAndCleanup(cachedData).catch((err) => {
+        console.error("[Firestore] Save/cleanup failed:", err);
+      });
+
       return NextResponse.json({
         ...cachedData,
         cached: true,
@@ -211,10 +292,9 @@ export async function GET(): Promise<NextResponse> {
     // Spara i cache
     setCache(cacheKey, response);
 
-    // Spara snapshot till Firestore (icke-blockerande)
-    // Om det misslyckas loggas felet men användaren får ändå sitt svar
-    saveSnapshotToFirestore(response).catch((err) => {
-      console.error("Firestore save failed:", err);
+    // Spara snapshot till Firestore OCH kör retention cleanup (icke-blockerande)
+    saveAndCleanup(response).catch((err) => {
+      console.error("[Firestore] Save/cleanup failed:", err);
     });
 
     return NextResponse.json({

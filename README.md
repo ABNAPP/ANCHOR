@@ -121,7 +121,30 @@ Om analysen fungerar men historik inte sparas:
 
 Firebase Firestore används **ENDAST** för att spara snapshot-historik av analysresultat. Inga fulla tidsserier eller stora JSON-payloads lagras.
 
-### Vad som sparas
+### Hur det fungerar
+
+Historik-systemet fungerar som en **logg**:
+
+1. **Varje analys-körning** sparar ett nytt snapshot till Firestore
+2. **Automatisk retention** håller databasen inom gränser
+3. **De senaste 200 snapshots** behålls (konfigurerbart i `src/config/mvp.ts`)
+4. **Äldre snapshots raderas** automatiskt efter varje sparning
+
+### Retention-inställningar
+
+I `src/config/mvp.ts`:
+
+```typescript
+firestore: {
+  retentionLimit: 200,      // Antal snapshots att behålla
+  maxDeletesPerRun: 50,     // Max raderingar per körning
+}
+```
+
+- **retentionLimit**: Hur många snapshots som behålls i databasen
+- **maxDeletesPerRun**: Begränsar cleanup-tid för att inte blockera response
+
+### Vad som sparas per snapshot
 
 Varje snapshot innehåller:
 - Tidsstämpel (serverTimestamp)

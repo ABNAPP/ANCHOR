@@ -15,8 +15,20 @@ export const MVP_CONFIG = {
       { id: "VIXCLS", name: "VIX", unit: "index" },
     ],
   },
+  firestore: {
+    /**
+     * Antal snapshots att behålla i historiken.
+     * Äldre snapshots raderas automatiskt efter varje analys.
+     */
+    retentionLimit: 200,
+    
+    /**
+     * Max antal snapshots att radera per körning.
+     * Begränsar cleanup-tid för att inte blockera response.
+     */
+    maxDeletesPerRun: 50,
+  },
 } as const;
 
 export type FredSeriesConfig = (typeof MVP_CONFIG.fred.series)[number];
 export type SeriesId = FredSeriesConfig["id"];
-
