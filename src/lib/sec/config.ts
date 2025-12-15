@@ -53,6 +53,9 @@ export const SEC_API = {
   /** Huvud-API för filings, submissions, etc. */
   DATA: "https://data.sec.gov",
   
+  /** WWW för statiska filer som company_tickers.json */
+  WWW: "https://www.sec.gov",
+  
   /** Arkiv för fullständiga filings */
   ARCHIVES: "https://www.sec.gov/cgi-bin/browse-edgar",
   

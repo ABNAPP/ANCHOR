@@ -4,12 +4,24 @@ En Next.js 14 applikation för real-time makroekonomisk analys och regime-detekt
 
 ## 🎯 Funktioner
 
+### Macro Engine
 - **Server-side datahämtning** från FRED API
 - **Regime-detektion** (Risk On / Risk Off / Tightening / Neutral)
 - **Yield Curve analys** (10Y-2Y slope)
 - **20-dagars förändringsberäkning** för alla serier
 - **In-memory cache** med 15 minuters TTL
 - **Snapshot-historik** med Firebase Firestore
+
+### Company Engine (SEC EDGAR)
+- **Sök bolag** via ticker eller namn
+- **Hämta filings** (10-K, 10-Q, 8-K) från SEC EDGAR
+- **Extrahera sektioner** (MD&A, Risk Factors, etc.)
+- **Promises/Claims extraction** (regelbaserad MVP)
+- **Spara till Firestore** för analys över tid
+- **24h caching** för ticker-map och submissions
+- **Rate limiting** (max 5 req/sek till SEC)
+
+### Gemensamt
 - **Responsivt dark-mode UI**
 
 ## 📊 Serier som analyseras
@@ -269,7 +281,9 @@ Om `SEC_USER_AGENT` saknas använder systemet en fallback och loggar en varning:
 
 Projektet innehåller SEC-stöd i:
 - `src/lib/sec/config.ts` - User-Agent hantering och API-konfiguration
-- `src/lib/sec/client.ts` - SEC EDGAR API-klient
+- `src/lib/sec/client.ts` - SEC EDGAR API-klient (med caching och throttling)
+- `src/lib/sec/parse.ts` - HTML/text parsing och sektionsextraktion
+- `src/lib/company/promises.ts` - Regelbaserad promise/claims-extraktion
 
 ---
 
@@ -418,6 +432,15 @@ Vercel kommer automatiskt bygga och deploya vid varje push till `main`.
 ├── src/
 │   ├── app/
 │   │   ├── api/
+│   │   │   ├── company/
+│   │   │   │   ├── search/
+│   │   │   │   │   └── route.ts        # Bolagssökning API
+│   │   │   │   ├── filings/
+│   │   │   │   │   └── route.ts        # Filings-lista API
+│   │   │   │   ├── filing/
+│   │   │   │   │   └── route.ts        # Enskild filing API
+│   │   │   │   └── extract-promises/
+│   │   │   │       └── route.ts        # Promise-extraktion API
 │   │   │   └── macro/
 │   │   │       ├── analyze/
 │   │   │       │   └── route.ts        # Analys API
@@ -425,12 +448,16 @@ Vercel kommer automatiskt bygga och deploya vid varje push till `main`.
 │   │   │           ├── route.ts        # Historik-lista API
 │   │   │           └── [id]/
 │   │   │               └── route.ts    # Historik-detalj API
+│   │   ├── company/
+│   │   │   └── page.tsx                # Company Engine UI
 │   │   ├── globals.css                 # Global styling
 │   │   ├── layout.tsx                  # Root layout
-│   │   └── page.tsx                    # Huvud-UI
+│   │   └── page.tsx                    # Huvud-UI (Macro)
 │   ├── config/
 │   │   └── mvp.ts                      # Konfiguration
 │   └── lib/
+│       ├── company/
+│       │   └── promises.ts             # Promise-extraktion
 │       ├── firebase/
 │       │   ├── admin.ts                # Firebase Admin init
 │       │   └── types.ts                # Firestore-typer
@@ -442,7 +469,8 @@ Vercel kommer automatiskt bygga och deploya vid varje push till `main`.
 │       │   └── regime.ts               # Regime-detektion
 │       └── sec/
 │           ├── config.ts               # SEC User-Agent config
-│           └── client.ts               # SEC EDGAR API-klient
+│           ├── client.ts               # SEC EDGAR API-klient
+│           └── parse.ts                # Filing-parsing
 ├── .gitignore
 ├── env.example                         # Miljövariabel-mall
 ├── next.config.js
@@ -544,6 +572,159 @@ Hämtar en specifik snapshot med alla detaljer.
 {
   "error": "Firebase inte konfigurerat",
   "message": "Konfigurera FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL och FIREBASE_PRIVATE_KEY..."
+}
+```
+
+---
+
+## 🏢 Company Engine API
+
+### GET `/api/company/search?q=<query>`
+
+Söker efter bolag via SEC EDGAR baserat på ticker eller namn.
+
+**Query Parameters:**
+- `q` (required): Sökterm (ticker eller bolagsnamn)
+
+**Response (200 OK):**
+
+```json
+{
+  "query": "AAPL",
+  "count": 1,
+  "results": [
+    {
+      "cik": "0000320193",
+      "ticker": "AAPL",
+      "name": "Apple Inc."
+    }
+  ]
+}
+```
+
+### GET `/api/company/filings?cik=<cik>&forms=10-K,10-Q,8-K`
+
+Hämtar filings för ett bolag.
+
+**Query Parameters:**
+- `cik` (required): CIK-nummer
+- `forms` (optional): Kommaseparerade form-typer (default: "10-K,10-Q,8-K")
+
+**Response (200 OK):**
+
+```json
+{
+  "cik": "0000320193",
+  "companyName": "Apple Inc.",
+  "tickers": ["AAPL"],
+  "formTypes": ["10-K", "10-Q", "8-K"],
+  "filingCount": 50,
+  "filings": [
+    {
+      "accessionNumber": "0000320193-24-000081",
+      "filingDate": "2024-11-01",
+      "reportDate": "2024-09-28",
+      "form": "10-K",
+      "primaryDocument": "aapl-20240928.htm",
+      "size": 15234567
+    }
+  ]
+}
+```
+
+### GET `/api/company/filing?cik=<cik>&accession=<accessionNumber>&doc=<document>&form=<formType>`
+
+Hämtar och parsar ett enskilt filing-dokument.
+
+**Query Parameters:**
+- `cik` (required): CIK-nummer
+- `accession` (required): Accession number
+- `doc` (required): Dokumentnamn
+- `form` (optional): Form-typ för korrekt parsing (default: "10-K")
+- `include` (optional): Sätt till "full" för att inkludera fullständigt sektionsinnehåll
+
+**Response (200 OK):**
+
+```json
+{
+  "cik": "0000320193",
+  "accessionNumber": "0000320193-24-000081",
+  "document": "aapl-20240928.htm",
+  "documentUrl": "https://data.sec.gov/Archives/...",
+  "rawLength": 15234567,
+  "cleanedLength": 1234567,
+  "sectionCount": 5,
+  "sections": [
+    {
+      "name": "item7",
+      "title": "Management's Discussion and Analysis (MD&A)",
+      "wordCount": 15000,
+      "characterCount": 85000
+    }
+  ]
+}
+```
+
+### POST `/api/company/extract-promises`
+
+Extraherar "promises" och "claims" från ett filing-dokument.
+
+**Request Body:**
+
+```json
+{
+  "cik": "0000320193",
+  "accessionNumber": "0000320193-24-000081",
+  "document": "aapl-20240928.htm",
+  "formType": "10-K",
+  "companyName": "Apple Inc.",
+  "ticker": "AAPL"
+}
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "cik": "0000320193",
+  "accessionNumber": "0000320193-24-000081",
+  "formType": "10-K",
+  "companyName": "Apple Inc.",
+  "ticker": "AAPL",
+  "extraction": {
+    "totalSentences": 5432,
+    "extractedCount": 87,
+    "promises": [
+      {
+        "text": "We expect to continue investing in research and development...",
+        "category": "investment",
+        "confidence": "high",
+        "source": "Management's Discussion and Analysis (MD&A)",
+        "keywords": ["invest", "r&d"]
+      }
+    ],
+    "summary": {
+      "byCategory": {
+        "guidance": 12,
+        "growth": 15,
+        "strategy": 8,
+        "investment": 20,
+        "product": 10,
+        "operational": 7,
+        "financial": 5,
+        "market": 5,
+        "risk_mitigation": 3,
+        "other": 2
+      },
+      "byConfidence": {
+        "high": 25,
+        "medium": 42,
+        "low": 20
+      }
+    }
+  },
+  "savedToFirestore": true,
+  "firestoreId": "abc123xyz"
 }
 ```
 

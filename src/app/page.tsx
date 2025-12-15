@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback, useEffect } from "react";
+import Link from "next/link";
 
 interface LatestTableRow {
   id: string;
@@ -248,6 +249,11 @@ export default function Home() {
           <p style={styles.subtitle}>
             Real-time makroekonomisk analys och regime-detektion
           </p>
+          <nav style={styles.nav}>
+            <Link href="/company" style={styles.navLink}>
+              ◆ Company Engine (SEC EDGAR) →
+            </Link>
+          </nav>
         </header>
 
         {/* Action Button */}
@@ -655,6 +661,22 @@ const styles: Record<string, React.CSSProperties> = {
   subtitle: {
     color: "var(--text-secondary)",
     fontSize: "0.9rem",
+  },
+  nav: {
+    marginTop: "1rem",
+  },
+  navLink: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "0.5rem",
+    padding: "0.5rem 1rem",
+    fontSize: "0.85rem",
+    color: "var(--accent-purple)",
+    backgroundColor: "var(--bg-secondary)",
+    border: "1px solid var(--border-color)",
+    borderRadius: "8px",
+    textDecoration: "none",
+    transition: "all 0.2s ease",
   },
   actionArea: {
     display: "flex",
