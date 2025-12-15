@@ -6,7 +6,7 @@
  * Extraherar "promises" och "claims" från ett SEC filing.
  * Sparar resultatet i Firestore om konfigurerat.
  * 
- * Använder robust fetch med fallback via index.json.
+ * OBS: 8-K filings avvisas eftersom de oftast saknar analysbart textinnehåll.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -35,7 +35,7 @@ export interface ExtractPromisesResponse {
   formType: string;
   companyName: string | null;
   ticker: string | null;
-  documentUsed: string; // Faktiskt använt dokument (kan skilja vid fallback)
+  documentUsed: string;
   usedFallback: boolean;
   extraction: PromiseExtractionResult;
   savedToFirestore: boolean;
@@ -46,9 +46,13 @@ export interface ExtractPromisesError {
   error: string;
   message: string;
   details?: string;
+  suggestion?: string;
 }
 
 const COMPANY_PROMISES_COLLECTION = "company_promises";
+
+// Form types som stöds för promise extraction
+const SUPPORTED_FORM_TYPES = ["10-K", "10-Q"];
 
 // ============================================
 // HANDLER
@@ -83,6 +87,27 @@ export async function POST(
     );
   }
 
+  // GUARD: Avvisa 8-K filings
+  const formUpper = formType.toUpperCase();
+  if (formUpper.includes("8-K")) {
+    console.log(`[Extract Promises] Rejected 8-K filing: CIK=${cik}, Accession=${accessionNumber}`);
+    return NextResponse.json(
+      {
+        error: "Unsupported form type",
+        message: "8-K filings saknar ofta analysbart textinnehåll. De innehåller vanligtvis endast exhibits, pressmeddelanden eller PDF-bilagor utan strukturerad MD&A-text.",
+        details: `Form type: ${formType}`,
+        suggestion: "Välj en 10-K (årsredovisning) eller 10-Q (kvartalsrapport) för promise extraction. Dessa innehåller Management's Discussion and Analysis (MD&A) och andra analysbara sektioner.",
+      },
+      { status: 400 }
+    );
+  }
+
+  // Varning för andra form types (men tillåt)
+  const isSupportedForm = SUPPORTED_FORM_TYPES.some(f => formUpper.includes(f));
+  if (!isSupportedForm) {
+    console.warn(`[Extract Promises] Unsupported form type attempted: ${formType}`);
+  }
+
   try {
     console.log(`[Extract Promises] Processing: CIK=${cik}, Form=${formType}`);
 
@@ -113,6 +138,20 @@ export async function POST(
     const parsed = parseFiling(fetchedDoc.content, formType);
     console.log(`[Extract Promises] Parsed ${parsed.sections.length} sections`);
 
+    // Kontrollera om vi hittade några sektioner
+    if (parsed.sections.length === 0) {
+      console.warn(`[Extract Promises] No sections found in ${formType} filing`);
+      return NextResponse.json(
+        {
+          error: "No analyzable content",
+          message: "Inga analysbara sektioner hittades i dokumentet. Det kan bero på att dokumentet är i ett format som inte stöds (t.ex. XBRL inline eller exhibit-only).",
+          details: `CIK: ${cik}, Form: ${formType}`,
+          suggestion: "Prova en annan filing eller verifiera att dokumentet innehåller standard SEC-sektioner.",
+        },
+        { status: 422 }
+      );
+    }
+
     // 3. Extrahera promises
     const extraction = extractPromises(parsed.sections);
     console.log(`[Extract Promises] Extracted ${extraction.extractedCount} promises`);
@@ -129,8 +168,8 @@ export async function POST(
             createdAt: FieldValue.serverTimestamp(),
             cik: cik.padStart(10, "0"),
             accessionNumber,
-            document: fetchedDoc.documentName, // Faktiskt använt dokument
-            originalDocument: document, // Ursprungligt begärt dokument
+            document: fetchedDoc.documentName,
+            originalDocument: document,
             usedFallback,
             formType,
             companyName: companyName || null,

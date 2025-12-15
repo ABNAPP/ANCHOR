@@ -204,6 +204,15 @@ export default function CompanyPage() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
+  // Kontrollera om filing är en 8-K (som ofta saknar analysbart innehåll)
+  const is8KFiling = (form: string) => form.toUpperCase().includes("8-K");
+
+  // Kontrollera om form type stöds för promise extraction
+  const isSupportedForExtraction = (form: string) => {
+    const upper = form.toUpperCase();
+    return upper.includes("10-K") || upper.includes("10-Q");
+  };
+
   // ============================================
   // RENDER
   // ============================================
@@ -307,18 +316,41 @@ export default function CompanyPage() {
 
             <h3 style={styles.sectionTitle}>Välj filing att analysera</h3>
             
+            {/* Info om 8-K */}
+            <div style={styles.formTypeInfo}>
+              <p style={styles.formTypeHint}>
+                💡 <strong>Tips:</strong> Välj <span style={styles.highlightGreen}>10-K</span> (årsredovisning) eller{" "}
+                <span style={styles.highlightGreen}>10-Q</span> (kvartalsrapport) för bästa resultat.{" "}
+                <span style={styles.highlightOrange}>8-K</span> innehåller ofta endast pressmeddelanden/exhibits.
+              </p>
+            </div>
+
             <div style={styles.filingsGrid}>
-              {filingsData.filings.slice(0, 20).map((filing) => (
-                <div
-                  key={filing.accessionNumber}
-                  style={styles.filingCard}
-                  onClick={() => handleSelectFiling(filing)}
-                >
-                  <div style={styles.filingForm}>{filing.form}</div>
-                  <div style={styles.filingDate}>{filing.filingDate}</div>
-                  <div style={styles.filingSize}>{formatFileSize(filing.size)}</div>
-                </div>
-              ))}
+              {filingsData.filings.slice(0, 20).map((filing) => {
+                const is8K = is8KFiling(filing.form);
+                return (
+                  <div
+                    key={filing.accessionNumber}
+                    style={{
+                      ...styles.filingCard,
+                      ...(is8K ? styles.filingCard8K : {}),
+                    }}
+                    onClick={() => handleSelectFiling(filing)}
+                  >
+                    <div style={{
+                      ...styles.filingForm,
+                      color: is8K ? "var(--accent-orange)" : "var(--accent-blue)",
+                    }}>
+                      {filing.form}
+                    </div>
+                    <div style={styles.filingDate}>{filing.filingDate}</div>
+                    <div style={styles.filingSize}>{formatFileSize(filing.size)}</div>
+                    {is8K && (
+                      <div style={styles.filing8KBadge}>⚠ Exhibits</div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
 
             <button onClick={handleReset} style={styles.resetButton}>
@@ -340,17 +372,55 @@ export default function CompanyPage() {
               </div>
             </div>
 
+            {/* Varning för 8-K */}
+            {is8KFiling(selectedFiling.form) && (
+              <div style={styles.warning8K}>
+                <div style={styles.warningIcon}>⚠️</div>
+                <div style={styles.warningContent}>
+                  <strong>8-K är inte optimal för promise extraction</strong>
+                  <p style={styles.warningText}>
+                    8-K filings innehåller ofta endast pressmeddelanden, exhibits (bilagor) 
+                    eller PDF-dokument utan strukturerad MD&A-text. Detta ger sällan 
+                    meningsfulla promises att analysera.
+                  </p>
+                  <p style={styles.warningRecommendation}>
+                    <strong>Rekommendation:</strong> Välj en{" "}
+                    <span style={styles.highlightGreen}>10-K</span> (årsredovisning) eller{" "}
+                    <span style={styles.highlightGreen}>10-Q</span> (kvartalsrapport) istället.
+                  </p>
+                </div>
+              </div>
+            )}
+
             <div style={styles.actionArea}>
-              <button
-                onClick={handleExtractPromises}
-                disabled={loading}
-                style={{...styles.button, ...styles.buttonLarge, ...(loading ? styles.buttonDisabled : {})}}
-              >
-                {loading ? "Extraherar..." : "🔍 Extrahera Promises"}
-              </button>
-              <p style={styles.actionHint}>
-                Hämtar dokumentet, parsar sektioner och extraherar framåtblickande uttalanden.
-              </p>
+              {isSupportedForExtraction(selectedFiling.form) ? (
+                <>
+                  <button
+                    onClick={handleExtractPromises}
+                    disabled={loading}
+                    style={{...styles.button, ...styles.buttonLarge, ...(loading ? styles.buttonDisabled : {})}}
+                  >
+                    {loading ? "Extraherar..." : "🔍 Extrahera Promises"}
+                  </button>
+                  <p style={styles.actionHint}>
+                    Hämtar dokumentet, parsar sektioner och extraherar framåtblickande uttalanden.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <button
+                    disabled
+                    style={{...styles.button, ...styles.buttonLarge, ...styles.buttonDisabled, backgroundColor: "var(--accent-orange)"}}
+                  >
+                    🚫 Extraction ej tillgänglig för {selectedFiling.form}
+                  </button>
+                  <p style={styles.actionHintWarning}>
+                    {is8KFiling(selectedFiling.form) 
+                      ? "8-K saknar ofta analysbart textinnehåll. Välj 10-K eller 10-Q istället."
+                      : `Form type "${selectedFiling.form}" stöds inte för promise extraction.`}
+                  </p>
+                </>
+              )}
             </div>
 
             <button onClick={() => setStep("filings")} style={styles.resetButton}>
@@ -659,6 +729,27 @@ const styles: Record<string, React.CSSProperties> = {
     gap: "0.75rem",
     marginBottom: "1rem",
   },
+  formTypeInfo: {
+    marginBottom: "1rem",
+    padding: "0.75rem 1rem",
+    backgroundColor: "rgba(59, 130, 246, 0.08)",
+    border: "1px solid rgba(59, 130, 246, 0.2)",
+    borderRadius: "8px",
+  },
+  formTypeHint: {
+    margin: 0,
+    fontSize: "0.85rem",
+    color: "var(--text-secondary)",
+    lineHeight: 1.5,
+  },
+  highlightGreen: {
+    color: "var(--accent-green)",
+    fontWeight: 600,
+  },
+  highlightOrange: {
+    color: "var(--accent-orange)",
+    fontWeight: 600,
+  },
   filingCard: {
     padding: "1rem",
     backgroundColor: "var(--bg-primary)",
@@ -667,6 +758,11 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     textAlign: "center",
     transition: "all 0.2s ease",
+    position: "relative" as const,
+  },
+  filingCard8K: {
+    borderColor: "var(--accent-orange)",
+    backgroundColor: "rgba(251, 146, 60, 0.05)",
   },
   filingForm: {
     fontWeight: 700,
@@ -682,6 +778,15 @@ const styles: Record<string, React.CSSProperties> = {
   filingSize: {
     fontSize: "0.7rem",
     color: "var(--text-muted)",
+  },
+  filing8KBadge: {
+    marginTop: "0.5rem",
+    padding: "0.2rem 0.5rem",
+    fontSize: "0.65rem",
+    fontWeight: 600,
+    color: "var(--accent-orange)",
+    backgroundColor: "rgba(251, 146, 60, 0.15)",
+    borderRadius: "4px",
   },
   extractPreview: {
     marginBottom: "1.5rem",
@@ -702,6 +807,39 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "0.8rem",
     color: "var(--text-muted)",
     marginTop: "0.75rem",
+  },
+  actionHintWarning: {
+    fontSize: "0.8rem",
+    color: "var(--accent-orange)",
+    marginTop: "0.75rem",
+    fontWeight: 500,
+  },
+  warning8K: {
+    display: "flex",
+    gap: "1rem",
+    padding: "1rem",
+    backgroundColor: "rgba(251, 146, 60, 0.1)",
+    border: "1px solid rgba(251, 146, 60, 0.3)",
+    borderRadius: "8px",
+    marginBottom: "1.5rem",
+  },
+  warningIcon: {
+    fontSize: "1.5rem",
+    flexShrink: 0,
+  },
+  warningContent: {
+    flex: 1,
+  },
+  warningText: {
+    margin: "0.5rem 0",
+    fontSize: "0.85rem",
+    color: "var(--text-secondary)",
+    lineHeight: 1.5,
+  },
+  warningRecommendation: {
+    margin: 0,
+    fontSize: "0.85rem",
+    color: "var(--text-primary)",
   },
   resultsSummary: {
     marginBottom: "1.5rem",
