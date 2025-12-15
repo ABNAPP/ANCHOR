@@ -4,11 +4,12 @@
  * GET /api/company/filing?cik=<cik>&accession=<accessionNumber>&doc=<document>&form=<formType>
  * 
  * Hämtar och parsar ett enskilt SEC filing-dokument.
+ * Använder robust fetch med fallback via index.json.
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getFilingDocument, buildFilingDocumentUrl } from "@/lib/sec/client";
-import { parseFiling, FilingSection } from "@/lib/sec/parse";
+import { fetchFilingDocument, buildFilingDocumentUrl, FetchedDocument } from "@/lib/sec/client";
+import { parseFiling, FilingSection, truncateText } from "@/lib/sec/parse";
 
 export interface FilingSectionSummary {
   name: string;
@@ -22,16 +23,20 @@ export interface FilingResponse {
   accessionNumber: string;
   document: string;
   documentUrl: string;
+  sourceUrl: string; // Faktisk URL som användes (kan skilja vid fallback)
+  usedFallback: boolean;
   rawLength: number;
   cleanedLength: number;
   sectionCount: number;
   sections: FilingSectionSummary[];
+  textPreview?: string; // Första 2000 tecken av rensat innehåll
   fullSections?: FilingSection[];
 }
 
 export interface FilingError {
   error: string;
   message: string;
+  details?: string;
 }
 
 export async function GET(
@@ -43,6 +48,7 @@ export async function GET(
   const doc = searchParams.get("doc")?.trim();
   const form = searchParams.get("form")?.trim() || "10-K";
   const includeFull = searchParams.get("include") === "full";
+  const includePreview = searchParams.get("preview") !== "false";
 
   if (!cik || !accession || !doc) {
     return NextResponse.json(
@@ -57,14 +63,35 @@ export async function GET(
   try {
     console.log(`[Filing] Fetching: CIK=${cik}, Accession=${accession}, Doc=${doc}`);
 
-    const rawContent = await getFilingDocument(cik, accession, doc);
+    // Robust fetch med fallback
+    const fetchedDoc: FetchedDocument | null = await fetchFilingDocument(cik, accession, doc);
     
-    console.log(`[Filing] Received ${rawContent.length} bytes, parsing...`);
+    if (!fetchedDoc) {
+      console.error(`[Filing] Document not found after all attempts: CIK=${cik}, Accession=${accession}`);
+      return NextResponse.json(
+        {
+          error: "Filing not found",
+          message: `Dokumentet kunde inte hämtas från SEC EDGAR. Varken primärt dokument (${doc}) eller fallback-dokument hittades.`,
+          details: `CIK: ${cik}, Accession: ${accession}`,
+        },
+        { status: 404 }
+      );
+    }
+    
+    const usedFallback = fetchedDoc.documentName !== doc;
+    
+    if (usedFallback) {
+      console.info(`[Filing] Used fallback document: ${fetchedDoc.documentName} instead of ${doc}`);
+    }
+    
+    console.log(`[Filing] Received ${fetchedDoc.content.length} bytes, parsing...`);
 
-    const parsed = parseFiling(rawContent, form);
+    // Parsa dokumentet
+    const parsed = parseFiling(fetchedDoc.content, form);
 
     console.log(`[Filing] Parsed: ${parsed.sections.length} sections found`);
 
+    // Bygg section summaries
     const sectionSummaries: FilingSectionSummary[] = parsed.sections.map((s) => ({
       name: s.name,
       title: s.title,
@@ -72,17 +99,26 @@ export async function GET(
       characterCount: s.content.length,
     }));
 
+    // Bygg response
     const response: FilingResponse = {
       cik: cik.padStart(10, "0"),
       accessionNumber: accession,
-      document: doc,
-      documentUrl: buildFilingDocumentUrl(cik, accession, doc),
+      document: fetchedDoc.documentName, // Faktiskt använt dokument
+      documentUrl: buildFilingDocumentUrl(cik, accession, doc), // Ursprunglig förfrågan
+      sourceUrl: fetchedDoc.sourceUrl, // Faktisk källa
+      usedFallback,
       rawLength: parsed.rawLength,
       cleanedLength: parsed.cleanedLength,
       sectionCount: parsed.sections.length,
       sections: sectionSummaries,
     };
 
+    // Inkludera textpreview om begärt (default: ja)
+    if (includePreview) {
+      response.textPreview = truncateText(parsed.fullText, 2000);
+    }
+
+    // Inkludera fullständiga sektioner om begärt
     if (includeFull) {
       response.fullSections = parsed.sections;
     }
@@ -94,13 +130,25 @@ export async function GET(
     const message =
       error instanceof Error ? error.message : "Ett oväntat fel uppstod";
 
+    // Ge mer specifik felinfo
     if (message.includes("404")) {
       return NextResponse.json(
         {
           error: "Filing not found",
-          message: `Dokumentet hittades inte: ${doc}`,
+          message: `Dokumentet hittades inte på SEC EDGAR: ${doc}`,
+          details: `CIK: ${cik}, Accession: ${accession}`,
         },
         { status: 404 }
+      );
+    }
+
+    if (message.includes("timeout") || message.includes("Timeout")) {
+      return NextResponse.json(
+        {
+          error: "Request timeout",
+          message: "SEC EDGAR svarade inte i tid. Försök igen senare.",
+        },
+        { status: 504 }
       );
     }
 
@@ -113,4 +161,3 @@ export async function GET(
     );
   }
 }
-

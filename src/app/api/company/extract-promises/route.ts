@@ -5,11 +5,13 @@
  * 
  * Extraherar "promises" och "claims" från ett SEC filing.
  * Sparar resultatet i Firestore om konfigurerat.
+ * 
+ * Använder robust fetch med fallback via index.json.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
-import { getFilingDocument } from "@/lib/sec/client";
+import { fetchFilingDocument, FetchedDocument } from "@/lib/sec/client";
 import { parseFiling } from "@/lib/sec/parse";
 import { extractPromises, PromiseExtractionResult } from "@/lib/company/promises";
 import { getFirestoreDb, isFirebaseConfigured } from "@/lib/firebase/admin";
@@ -33,6 +35,8 @@ export interface ExtractPromisesResponse {
   formType: string;
   companyName: string | null;
   ticker: string | null;
+  documentUsed: string; // Faktiskt använt dokument (kan skilja vid fallback)
+  usedFallback: boolean;
   extraction: PromiseExtractionResult;
   savedToFirestore: boolean;
   firestoreId?: string;
@@ -41,6 +45,7 @@ export interface ExtractPromisesResponse {
 export interface ExtractPromisesError {
   error: string;
   message: string;
+  details?: string;
 }
 
 const COMPANY_PROMISES_COLLECTION = "company_promises";
@@ -81,12 +86,31 @@ export async function POST(
   try {
     console.log(`[Extract Promises] Processing: CIK=${cik}, Form=${formType}`);
 
-    // 1. Hämta filing-dokumentet
-    const rawContent = await getFilingDocument(cik, accessionNumber, document);
-    console.log(`[Extract Promises] Fetched ${rawContent.length} bytes`);
+    // 1. Hämta filing-dokumentet med robust fetch
+    const fetchedDoc: FetchedDocument | null = await fetchFilingDocument(cik, accessionNumber, document);
+    
+    if (!fetchedDoc) {
+      console.error(`[Extract Promises] Document not found: CIK=${cik}, Accession=${accessionNumber}`);
+      return NextResponse.json(
+        {
+          error: "Filing not found",
+          message: `Dokumentet kunde inte hämtas från SEC EDGAR. Varken primärt dokument (${document}) eller fallback-dokument hittades.`,
+          details: `CIK: ${cik}, Accession: ${accessionNumber}`,
+        },
+        { status: 404 }
+      );
+    }
+    
+    const usedFallback = fetchedDoc.documentName !== document;
+    
+    if (usedFallback) {
+      console.info(`[Extract Promises] Used fallback document: ${fetchedDoc.documentName} instead of ${document}`);
+    }
+    
+    console.log(`[Extract Promises] Fetched ${fetchedDoc.content.length} bytes`);
 
     // 2. Parsa filing
-    const parsed = parseFiling(rawContent, formType);
+    const parsed = parseFiling(fetchedDoc.content, formType);
     console.log(`[Extract Promises] Parsed ${parsed.sections.length} sections`);
 
     // 3. Extrahera promises
@@ -105,7 +129,9 @@ export async function POST(
             createdAt: FieldValue.serverTimestamp(),
             cik: cik.padStart(10, "0"),
             accessionNumber,
-            document,
+            document: fetchedDoc.documentName, // Faktiskt använt dokument
+            originalDocument: document, // Ursprungligt begärt dokument
+            usedFallback,
             formType,
             companyName: companyName || null,
             ticker: ticker || null,
@@ -143,6 +169,8 @@ export async function POST(
       formType,
       companyName: companyName || null,
       ticker: ticker || null,
+      documentUsed: fetchedDoc.documentName,
+      usedFallback,
       extraction,
       savedToFirestore,
       firestoreId,
@@ -157,9 +185,20 @@ export async function POST(
       return NextResponse.json(
         {
           error: "Filing not found",
-          message: `Dokumentet hittades inte`,
+          message: `Dokumentet hittades inte på SEC EDGAR`,
+          details: `CIK: ${cik}, Accession: ${accessionNumber}`,
         },
         { status: 404 }
+      );
+    }
+
+    if (message.includes("timeout") || message.includes("Timeout")) {
+      return NextResponse.json(
+        {
+          error: "Request timeout",
+          message: "SEC EDGAR svarade inte i tid. Försök igen senare.",
+        },
+        { status: 504 }
       );
     }
 
@@ -172,4 +211,3 @@ export async function POST(
     );
   }
 }
-

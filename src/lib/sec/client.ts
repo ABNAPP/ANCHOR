@@ -87,6 +87,27 @@ export interface FilingInfo {
   size: number;
 }
 
+export interface FilingIndexFile {
+  name: string;
+  type?: string;
+  size?: number;
+  lastModified?: string;
+}
+
+export interface FilingIndex {
+  directory: {
+    item: FilingIndexFile[];
+    name: string;
+    "parent-dir": string;
+  };
+}
+
+export interface FetchedDocument {
+  content: string;
+  sourceUrl: string;
+  documentName: string;
+}
+
 // ============================================
 // CACHING
 // ============================================
@@ -169,8 +190,9 @@ export async function fetchFromSec<T>(url: string): Promise<T> {
 
 /**
  * Hämtar text/HTML från SEC med korrekt User-Agent och throttling.
+ * Returnerar null vid 404 istället för att kasta fel.
  */
-export async function fetchTextFromSec(url: string): Promise<string> {
+export async function fetchTextFromSec(url: string): Promise<string | null> {
   await throttle();
   
   const options = createSecFetchOptions("text/html, text/plain, */*");
@@ -178,6 +200,11 @@ export async function fetchTextFromSec(url: string): Promise<string> {
   console.log(`[SEC] Fetching text: ${url}`);
   
   const response = await fetch(url, options);
+  
+  if (response.status === 404) {
+    console.warn(`[SEC] Document not found (404): ${url}`);
+    return null;
+  }
   
   if (!response.ok) {
     throw new Error(
@@ -189,10 +216,62 @@ export async function fetchTextFromSec(url: string): Promise<string> {
 }
 
 /**
+ * Hämtar JSON från SEC, returnerar null vid 404.
+ */
+export async function fetchJsonFromSecSafe<T>(url: string): Promise<T | null> {
+  await throttle();
+  
+  const options = createSecFetchOptions();
+  
+  console.log(`[SEC] Fetching JSON: ${url}`);
+  
+  const response = await fetch(url, options);
+  
+  if (response.status === 404) {
+    console.warn(`[SEC] Resource not found (404): ${url}`);
+    return null;
+  }
+  
+  if (!response.ok) {
+    throw new Error(
+      `SEC API error: ${response.status} ${response.statusText} for ${url}`
+    );
+  }
+  
+  const data = await response.json();
+  return data as T;
+}
+
+/**
  * Väntar en specificerad tid.
  */
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ============================================
+// CIK & ACCESSION FORMATTING
+// ============================================
+
+/**
+ * Normaliserar CIK till 10-siffrigt format med ledande nollor.
+ */
+export function formatCikPadded(cik: string): string {
+  return cik.replace(/^0+/, "").padStart(10, "0");
+}
+
+/**
+ * Konverterar CIK till format utan ledande nollor (för Archives-URL:er).
+ */
+export function formatCikNoZeros(cik: string): string {
+  return parseInt(cik.replace(/^0+/, ""), 10).toString();
+}
+
+/**
+ * Tar bort bindestreck från accession number.
+ */
+export function formatAccessionNoHyphens(accessionNumber: string): string {
+  return accessionNumber.replace(/-/g, "");
 }
 
 // ============================================
@@ -281,7 +360,7 @@ export async function getCikByTicker(ticker: string): Promise<string | null> {
  * Cachas i 24h.
  */
 export async function getCompanySubmissions(cik: string): Promise<SecCompanyInfo> {
-  const paddedCik = cik.replace(/^0+/, "").padStart(10, "0");
+  const paddedCik = formatCikPadded(cik);
   
   // Kolla cache
   const cached = submissionsCache.get(paddedCik);
@@ -337,28 +416,166 @@ export async function getCompanyFilings(
 }
 
 /**
- * Bygger URL till ett filing-dokument.
+ * Bygger bas-URL till ett filing-arkiv (utan dokumentnamn).
  */
-export function buildFilingDocumentUrl(cik: string, accessionNumber: string, document: string): string {
-  const paddedCik = cik.replace(/^0+/, "").padStart(10, "0");
-  const accessionClean = accessionNumber.replace(/-/g, "");
+export function buildFilingArchiveUrl(cik: string, accessionNumber: string): string {
+  const cikNoZeros = formatCikNoZeros(cik);
+  const accessionNo = formatAccessionNoHyphens(accessionNumber);
   
-  return `${SEC_API.DATA}/Archives/edgar/data/${paddedCik}/${accessionClean}/${document}`;
+  return `${SEC_API.DATA}/Archives/edgar/data/${cikNoZeros}/${accessionNo}`;
 }
 
 /**
- * Hämtar innehållet i ett filing-dokument.
+ * Bygger URL till ett specifikt filing-dokument.
  */
-export async function getFilingDocument(cik: string, accessionNumber: string, document: string): Promise<string> {
-  const url = buildFilingDocumentUrl(cik, accessionNumber, document);
-  return fetchTextFromSec(url);
+export function buildFilingDocumentUrl(cik: string, accessionNumber: string, document: string): string {
+  const archiveUrl = buildFilingArchiveUrl(cik, accessionNumber);
+  return `${archiveUrl}/${document}`;
+}
+
+/**
+ * Hämtar index.json för en filing (listar alla filer i arkivet).
+ */
+export async function getFilingIndex(cik: string, accessionNumber: string): Promise<FilingIndex | null> {
+  const archiveUrl = buildFilingArchiveUrl(cik, accessionNumber);
+  const indexUrl = `${archiveUrl}/index.json`;
+  
+  console.log(`[SEC] Fetching filing index: ${indexUrl}`);
+  
+  return fetchJsonFromSecSafe<FilingIndex>(indexUrl);
+}
+
+/**
+ * Hittar det primära HTML-dokumentet från ett filing-index.
+ * Prioriterar .htm/.html-filer, undviker *_def.htm och -index.htm.
+ */
+export function findPrimaryHtmlDocument(index: FilingIndex): string | null {
+  const items = index.directory.item;
+  
+  // Filtrera till HTML-filer
+  const htmlFiles = items.filter(item => {
+    const name = item.name.toLowerCase();
+    return (name.endsWith(".htm") || name.endsWith(".html")) &&
+           !name.includes("_def.") &&
+           !name.endsWith("-index.htm") &&
+           !name.endsWith("-index.html") &&
+           !name.startsWith("R") && // Undvik R1.htm, R2.htm etc (XBRL rendering)
+           !name.includes("Financial_Report"); // Undvik XBRL Financial Report
+  });
+  
+  if (htmlFiles.length === 0) {
+    return null;
+  }
+  
+  // Sortera: föredra filer utan siffror i början (vanligtvis huvuddokumentet)
+  // och större filer (huvuddokument är ofta störst)
+  htmlFiles.sort((a, b) => {
+    // Prioritera filer som börjar med företagsnamn/ticker
+    const aStartsWithLetter = /^[a-z]/i.test(a.name);
+    const bStartsWithLetter = /^[a-z]/i.test(b.name);
+    if (aStartsWithLetter && !bStartsWithLetter) return -1;
+    if (!aStartsWithLetter && bStartsWithLetter) return 1;
+    
+    // Sedan efter storlek (större = troligare huvuddokument)
+    const aSize = a.size || 0;
+    const bSize = b.size || 0;
+    return bSize - aSize;
+  });
+  
+  return htmlFiles[0].name;
+}
+
+/**
+ * Hämtar innehållet i ett filing-dokument med fallback via index.json.
+ * 
+ * Logik:
+ * 1. Försök hämta primaryDocument direkt
+ * 2. Om 404: hämta index.json och välj första .htm/.html-fil
+ * 3. Om fortfarande 404: returnera null
+ */
+export async function fetchFilingDocument(
+  cik: string, 
+  accessionNumber: string, 
+  primaryDocument: string
+): Promise<FetchedDocument | null> {
+  const cikNoZeros = formatCikNoZeros(cik);
+  const accessionNo = formatAccessionNoHyphens(accessionNumber);
+  
+  // Steg 1: Försök med primaryDocument
+  const primaryUrl = buildFilingDocumentUrl(cik, accessionNumber, primaryDocument);
+  console.log(`[SEC] Attempting to fetch primary document: ${primaryUrl}`);
+  
+  const primaryContent = await fetchTextFromSec(primaryUrl);
+  
+  if (primaryContent !== null) {
+    console.log(`[SEC] Successfully fetched primary document: ${primaryDocument}`);
+    return {
+      content: primaryContent,
+      sourceUrl: primaryUrl,
+      documentName: primaryDocument,
+    };
+  }
+  
+  // Steg 2: primaryDocument misslyckades, prova index.json fallback
+  console.warn(`[SEC] Primary document not found, trying index.json fallback...`);
+  
+  const index = await getFilingIndex(cik, accessionNumber);
+  
+  if (!index) {
+    console.error(`[SEC] Could not fetch index.json for CIK ${cikNoZeros}, Accession ${accessionNo}`);
+    return null;
+  }
+  
+  // Hitta alternativt HTML-dokument
+  const fallbackDoc = findPrimaryHtmlDocument(index);
+  
+  if (!fallbackDoc) {
+    console.error(`[SEC] No suitable HTML document found in index.json`);
+    console.log(`[SEC] Available files: ${index.directory.item.map(i => i.name).join(", ")}`);
+    return null;
+  }
+  
+  console.info(`[SEC] Using fallback document: ${fallbackDoc}`);
+  
+  const fallbackUrl = buildFilingDocumentUrl(cik, accessionNumber, fallbackDoc);
+  const fallbackContent = await fetchTextFromSec(fallbackUrl);
+  
+  if (fallbackContent !== null) {
+    console.log(`[SEC] Successfully fetched fallback document: ${fallbackDoc}`);
+    return {
+      content: fallbackContent,
+      sourceUrl: fallbackUrl,
+      documentName: fallbackDoc,
+    };
+  }
+  
+  console.error(`[SEC] Failed to fetch fallback document: ${fallbackDoc}`);
+  return null;
+}
+
+/**
+ * Äldre funktion - behålls för bakåtkompatibilitet.
+ * Använd fetchFilingDocument för robust hämtning med fallback.
+ */
+export async function getFilingDocument(
+  cik: string, 
+  accessionNumber: string, 
+  document: string
+): Promise<string> {
+  const result = await fetchFilingDocument(cik, accessionNumber, document);
+  
+  if (!result) {
+    throw new Error(`Could not fetch filing document: ${document}`);
+  }
+  
+  return result.content;
 }
 
 /**
  * Hämtar company facts (XBRL data) för ett företag.
  */
 export async function getCompanyFacts(cik: string): Promise<Record<string, unknown>> {
-  const paddedCik = cik.replace(/^0+/, "").padStart(10, "0");
+  const paddedCik = formatCikPadded(cik);
   const url = `${SEC_API.DATA}/api/xbrl/companyfacts/CIK${paddedCik}.json`;
   return fetchFromSec<Record<string, unknown>>(url);
 }
