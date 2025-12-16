@@ -3,6 +3,13 @@
 import { useState, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { DebugOverlay, DebugError as DebugErrorType } from "@/components/DebugOverlay";
+import { 
+  verifyPromise, 
+  createVerificationError, 
+  normalizeVerificationError,
+  type StandardPromise,
+  type VerifyPromiseOptions 
+} from "@/lib/company/verification-service";
 
 // ============================================
 // TYPES
@@ -43,6 +50,14 @@ type PromiseType =
 
 type TimeHorizon = "NEXT_Q" | "FY1" | "FY2PLUS" | "LONG_TERM" | "UNSPECIFIED";
 
+/**
+ * Standardiserad Promise-modell (MVP)
+ * 
+ * verified: boolean - Om promise är verifierad
+ * verifiedAt: string | null - ISO timestamp när verifiering skedde
+ * verifiedBy: string | null - Vem/vad som verifierade ("kpi" | "manual" | "auto")
+ * relatedKpiId: string | null - KPI som användes (får finnas men används inte ännu)
+ */
 interface ExtractedPromise {
   text: string;
   type: PromiseType;
@@ -52,6 +67,13 @@ interface ExtractedPromise {
   confidenceScore: number;
   keywords: string[];
   source: string;
+  // Standardiserade verifieringsfält (MVP)
+  verified?: boolean;
+  verifiedAt?: string | null;
+  verifiedBy?: string | null;
+  relatedKpiId?: string | null;
+  // Detaljerad verifieringsdata (befintlig struktur)
+  verification?: VerificationResult | null;
   score?: {
     score0to100: number;
     status: "HELD" | "MIXED" | "FAILED" | "UNCLEAR";
@@ -275,6 +297,8 @@ export default function CompanyPage() {
   const [selectedVerification, setSelectedVerification] = useState<{ index: number; result: VerificationResult } | null>(null);
   const [selectedPromiseIndices, setSelectedPromiseIndices] = useState<Set<number>>(new Set());
   const [batchVerifying, setBatchVerifying] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
+  const [bulkErrors, setBulkErrors] = useState<Array<{ index: number; message: string }>>([]);
 
   // Scoring State
   const [companyScore, setCompanyScore] = useState<number | null>(null);
@@ -595,6 +619,19 @@ export default function CompanyPage() {
     }
   }, [selectedCompany, addDebugError]);
 
+  /**
+   * DATA LAYER: API-anrop för verifiering
+   * 
+   * Denna funktion hanterar API-kommunikation och state-uppdatering.
+   * 
+   * AFFÄRSLOGIK FINNS I: src/lib/company/verification-service.ts
+   * - skip-logik (skip om redan verifierad)
+   * - sätt verified, verifiedAt, verifiedBy
+   * - enhetlig felhantering
+   * 
+   * UI-KOMPONENTER: Knappar, checkboxar, status-visning (denna fil)
+   * DATA-LAGER: API-anrop, state-uppdatering (denna fil + API routes)
+   */
   const handleVerifyPromise = useCallback(async (promiseIndex: number, promise: ExtractedPromise) => {
     if (!selectedCompany || !selectedFiling || !extractResponse) return;
 
@@ -604,10 +641,39 @@ export default function CompanyPage() {
       return;
     }
 
-    // Markera som verifierar
+    // Konvertera ExtractedPromise till StandardPromise för verification-service
+    const standardPromise: StandardPromise = {
+      id: promiseIndex.toString(),
+      verified: promise.verified ?? false,
+      verifiedAt: promise.verifiedAt ?? null,
+      verifiedBy: promise.verifiedBy ?? null,
+      relatedKpiId: promise.relatedKpiId ?? null,
+      verification: promise.verification ?? null,
+    };
+
+    // BUSINESS LOGIC: Använd central verifieringsfunktion för skip-logik
+    const options: VerifyPromiseOptions = {
+      skipIfVerified: true, // Skip om redan verifierad
+      forceReverify: false,
+      verifiedBy: "manual", // Manuell verifiering via UI
+    };
+
+    // Kontrollera om vi ska skipa (via verification-service)
+    const skipCheck = verifyPromise(standardPromise, standardPromise.verification || null, {
+      ...options,
+      skipIfVerified: true,
+    });
+
+    if (skipCheck.skipped) {
+      // Promise är redan verifierad, inget att göra
+      return;
+    }
+
+    // Markera som verifierar (UI STATE)
     setVerifyingIndices((prev) => new Set(prev).add(promiseIndex));
 
     try {
+      // DATA LAYER: API-anrop
       const res = await fetch("/api/company/verify-promise", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -636,7 +702,45 @@ export default function CompanyPage() {
         const errorDetails = data.error?.details ? JSON.stringify(data.error.details, null, 2) : undefined;
         addDebugError("verify", new Error(errorMsg), res.status, errorDetails);
         
-        // Set error result
+        // BUSINESS LOGIC: Använd verification-service för enhetlig felhantering
+        const errorResult = verifyPromise(
+          standardPromise,
+          null,
+          options
+        );
+
+        // DATA LAYER: Uppdatera state med fel-resultat
+        if (errorResult.error) {
+          setVerificationResults((prev) => {
+            const newMap = new Map(prev);
+            newMap.set(promiseIndex, {
+              status: "UNRESOLVED",
+              confidence: "low",
+              kpiUsed: null,
+              comparison: { before: null, after: null, deltaAbs: null, deltaPct: null },
+              notes: errorResult.error?.message || errorMsg,
+              reasoning: ["Ett fel uppstod vid verifieringen"],
+            });
+            return newMap;
+          });
+        }
+        return;
+      }
+
+      // Handle success response (normalized format: data.ok === true || old format)
+      const verification = data.data?.verification || data.verification;
+      if (!verification) {
+        throw new Error("Saknar verification data i response");
+      }
+
+      // BUSINESS LOGIC: Använd verification-service för att uppdatera promise
+      const verifyResult = verifyPromise(standardPromise, verification, options);
+
+      if (!verifyResult.success || verifyResult.error) {
+        // Fel i verifieringslogiken
+        const errorMsg = verifyResult.error?.message || "Verifiering misslyckades";
+        addDebugError("verify", new Error(errorMsg));
+        
         setVerificationResults((prev) => {
           const newMap = new Map(prev);
           newMap.set(promiseIndex, {
@@ -652,26 +756,46 @@ export default function CompanyPage() {
         return;
       }
 
-      // Handle success response (normalized format: data.ok === true || old format)
-      const verification = data.data?.verification || data.verification;
-      if (!verification) {
-        throw new Error("Saknar verification data i response");
-      }
+      // DATA LAYER: Uppdatera state med verifieringsresultat
+      if (verifyResult.verification) {
+        setVerificationResults((prev) => {
+          const newMap = new Map(prev);
+          newMap.set(promiseIndex, verifyResult.verification!);
+          return newMap;
+        });
 
-      // Validate verification structure
-      if (!verification.status || !verification.confidence) {
-        throw new Error("Ogiltig verification struktur");
+        // Uppdatera extractResponse med standardiserade fält
+        setExtractResponse((prev) => {
+          if (!prev || !verifyResult.promise) return prev;
+          const updatedPromises = prev.extraction.promises.map((p, idx) => {
+            if (idx === promiseIndex) {
+              return {
+                ...p,
+                verified: verifyResult.promise!.verified,
+                verifiedAt: verifyResult.promise!.verifiedAt,
+                verifiedBy: verifyResult.promise!.verifiedBy,
+                relatedKpiId: verifyResult.promise!.relatedKpiId,
+                verification: verifyResult.verification,
+              };
+            }
+            return p;
+          });
+          return {
+            ...prev,
+            extraction: {
+              ...prev.extraction,
+              promises: updatedPromises,
+            },
+          };
+        });
       }
-
-      // Spara resultat
-      setVerificationResults((prev) => {
-        const newMap = new Map(prev);
-        newMap.set(promiseIndex, verification);
-        return newMap;
-      });
     } catch (err) {
-      addDebugError("verify", err);
-      // Lägg till ett felsvar
+      // BUSINESS LOGIC: Normalisera fel via verification-service
+      const normalizedError = normalizeVerificationError(err);
+      const errorMessage = normalizedError?.message || (err instanceof Error ? err.message : "Verifiering misslyckades");
+      addDebugError("verify", new Error(errorMessage));
+      
+      // DATA LAYER: Uppdatera state med fel-resultat
       setVerificationResults((prev) => {
         const newMap = new Map(prev);
         newMap.set(promiseIndex, {
@@ -679,12 +803,13 @@ export default function CompanyPage() {
           confidence: "low",
           kpiUsed: null,
           comparison: { before: null, after: null, deltaAbs: null, deltaPct: null },
-          notes: err instanceof Error ? err.message : "Verifiering misslyckades",
+          notes: errorMessage,
           reasoning: ["Ett fel uppstod vid verifieringen"],
         });
         return newMap;
       });
     } finally {
+      // UI STATE: Ta bort från verifying indices
       setVerifyingIndices((prev) => {
         const newSet = new Set(prev);
         newSet.delete(promiseIndex);
@@ -693,6 +818,132 @@ export default function CompanyPage() {
     }
   }, [selectedCompany, selectedFiling, filingsData, extractResponse, addDebugError]);
 
+  // NEW: Bulk verification handlers using new endpoints
+  const handleBulkVerifyAll = useCallback(async () => {
+    if (!selectedCompany || !selectedFiling || !extractResponse?.firestoreId) {
+      addDebugError("verify", new Error("Saknar company, filing eller firestoreId"));
+      return;
+    }
+
+    setBatchVerifying(true);
+    setBulkProgress({ done: 0, total: 1 });
+    setBulkErrors([]);
+
+    try {
+      const res = await fetch("/api/company/verify-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          promiseDocId: extractResponse.firestoreId,
+          cik: selectedCompany.cik,
+          ticker: selectedCompany.ticker,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        const errorMsg = data.error?.message || "Bulk-verifiering misslyckades";
+        addDebugError("verify", new Error(errorMsg), res.status);
+        return;
+      }
+
+      // Visa summary
+      const summary = data.summary;
+      console.log("[verify-all] Summary:", summary);
+      
+      // Refetch dokumentet från Firestore för att få uppdaterade promises
+      if (extractResponse.firestoreId) {
+        try {
+          // Hämta uppdaterat dokument (via extract-promises endpoint eller direkt från Firestore)
+          // För nu: Uppdatera state med summary och visa meddelande
+          // TODO: Implementera refetch från Firestore om det behövs
+        } catch (refetchError) {
+          console.error("[verify-all] Failed to refetch:", refetchError);
+        }
+      }
+
+      // Visa success-meddelande med summary
+      const summaryMsg = `Bulk-verifiering klar: ${summary.updated} uppdaterade, ${summary.skipped} hoppades över, ${summary.held} Held, ${summary.failed} Failed, ${summary.mixed} Mixed, ${summary.unclear} Unclear${summary.errors.length > 0 ? `, ${summary.errors.length} fel` : ''}`;
+      console.log("[verify-all]", summaryMsg);
+      
+      // Uppdatera UI-meddelande (använd addDebugError med success-status eller visa i UI)
+      // För nu, visa i console. I produktion skulle man visa en toast eller success-banner.
+
+    } catch (err) {
+      addDebugError("verify", err);
+    } finally {
+      setBatchVerifying(false);
+      setBulkProgress(null);
+    }
+  }, [selectedCompany, selectedFiling, extractResponse, addDebugError]);
+
+  const handleBulkVerifySelected = useCallback(async () => {
+    if (!selectedCompany || !selectedFiling || !extractResponse?.firestoreId) {
+      addDebugError("verify", new Error("Saknar company, filing eller firestoreId"));
+      return;
+    }
+
+    if (selectedPromiseIndices.size === 0) {
+      addDebugError("verify", new Error("Inga promises valda"));
+      return;
+    }
+
+    setBatchVerifying(true);
+    setBulkProgress({ done: 0, total: selectedPromiseIndices.size });
+    setBulkErrors([]);
+
+    try {
+      const res = await fetch("/api/company/verify-selected", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          promiseDocId: extractResponse.firestoreId,
+          promiseIds: Array.from(selectedPromiseIndices),
+          cik: selectedCompany.cik,
+          ticker: selectedCompany.ticker,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        const errorMsg = data.error?.message || "Bulk-verifiering misslyckades";
+        addDebugError("verify", new Error(errorMsg), res.status);
+        return;
+      }
+
+      // Visa summary
+      const summary = data.summary;
+      console.log("[verify-selected] Summary:", summary);
+      
+      // Refetch dokumentet från Firestore för att få uppdaterade promises
+      if (extractResponse.firestoreId) {
+        try {
+          // Hämta uppdaterat dokument (via extract-promises endpoint eller direkt från Firestore)
+          // För nu: Uppdatera state med summary och visa meddelande
+          // TODO: Implementera refetch från Firestore om det behövs
+        } catch (refetchError) {
+          console.error("[verify-selected] Failed to refetch:", refetchError);
+        }
+      }
+
+      // Visa success-meddelande med summary
+      const summaryMsg = `Bulk-verifiering klar: ${summary.updated} uppdaterade, ${summary.skipped} hoppades över, ${summary.held} Held, ${summary.failed} Failed, ${summary.mixed} Mixed, ${summary.unclear} Unclear${summary.errors.length > 0 ? `, ${summary.errors.length} fel` : ''}`;
+      console.log("[verify-selected]", summaryMsg);
+
+      // Rensa valda promises
+      setSelectedPromiseIndices(new Set());
+
+    } catch (err) {
+      addDebugError("verify", err);
+    } finally {
+      setBatchVerifying(false);
+      setBulkProgress(null);
+    }
+  }, [selectedCompany, selectedFiling, extractResponse, selectedPromiseIndices, addDebugError]);
+
+  // OLD: Keep old handler for backward compatibility, but mark as deprecated
   const handleBatchVerify = useCallback(async (promiseIndexes?: number[]) => {
     if (!selectedCompany || !selectedFiling || !extractResponse) return;
 
@@ -719,104 +970,267 @@ export default function CompanyPage() {
       return;
     }
 
-    // Markera som verifierar
+    // Reset state
     setBatchVerifying(true);
+    setBulkProgress({ done: 0, total: indexesToVerify.length });
+    setBulkErrors([]);
     setVerifyingIndices((prev) => {
       const newSet = new Set(prev);
       indexesToVerify.forEach((idx) => newSet.add(idx));
       return newSet;
     });
 
-    try {
-      const res = await fetch("/api/company/verify-batch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cik10: selectedCompany.cik,
-          companyName: filingsData?.companyName || extractResponse.companyName,
-          ticker: selectedCompany.ticker,
-          filingAccession: selectedFiling.accessionNumber,
-          filingDate: selectedFiling.filingDate,
-          promiseDocId: extractResponse.firestoreId || `temp-${selectedFiling.accessionNumber}`,
-          promiseIndexes: indexesToVerify,
-          promises: promises.map((p) => ({
-            text: p.text,
-            type: p.type,
-            timeHorizon: p.timeHorizon,
-            measurable: p.measurable,
-            confidence: p.confidence,
-          })),
-        }),
-      });
-
-      const data = await res.json().catch(() => ({ ok: false, error: { message: "Failed to parse JSON response" } }));
-
-      // Handle normalized response format
-      if (!res.ok || !data.ok) {
-        const errorMsg = data.error?.message || data.message || "Batch verifiering misslyckades";
-        addDebugError("verify", new Error(errorMsg), res.status);
-        return;
+    /**
+     * DATA LAYER: API-anrop för batch-verifiering
+     * 
+     * Denna helper anropar API och använder verification-service för affärslogik.
+     */
+    const verifySinglePromise = async (promiseIndex: number): Promise<{ success: boolean; verification?: VerificationResult; error?: string; skipped?: boolean }> => {
+      const promise = promises[promiseIndex];
+      if (!promise) {
+        return { success: false, error: "Promise not found" };
       }
 
-      // Handle success response
-      const results = data.data?.results || [];
-      if (!Array.isArray(results)) {
-        throw new Error("Ogiltigt svar från batch verify API");
+      // BUSINESS LOGIC: Konvertera till StandardPromise och kontrollera skip
+      const standardPromise: StandardPromise = {
+        id: promiseIndex.toString(),
+        verified: promise.verified ?? false,
+        verifiedAt: promise.verifiedAt ?? null,
+        verifiedBy: promise.verifiedBy ?? null,
+        relatedKpiId: promise.relatedKpiId ?? null,
+        verification: promise.verification ?? null,
+      };
+
+      const options: VerifyPromiseOptions = {
+        skipIfVerified: true,
+        forceReverify: false,
+        verifiedBy: "kpi", // Batch-verifiering via KPI
+      };
+
+      // Kontrollera om vi ska skipa
+      const skipCheck = verifyPromise(standardPromise, standardPromise.verification || null, options);
+      if (skipCheck.skipped) {
+        return { success: true, skipped: true, verification: standardPromise.verification || undefined };
       }
 
-      // Uppdatera verification results
-      setVerificationResults((prev) => {
-        const newMap = new Map(prev);
-        results.forEach((result: any) => {
-          if (result.promiseIndex !== undefined && result.status) {
-            newMap.set(result.promiseIndex, {
-              status: result.status,
-              confidence: result.confidence,
-              kpiUsed: result.kpiUsed,
-              comparison: result.comparison,
-              notes: result.notes,
-              reasoning: result.reasoning || [],
+      try {
+        // DATA LAYER: API-anrop
+        const res = await fetch("/api/company/verify-promise", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            cik10: selectedCompany.cik,
+            companyName: filingsData?.companyName || extractResponse.companyName,
+            ticker: selectedCompany.ticker,
+            filingAccession: selectedFiling.accessionNumber,
+            filingDate: selectedFiling.filingDate,
+            promiseIndex,
+            promise: {
+              text: promise.text,
+              type: promise.type,
+              timeHorizon: promise.timeHorizon,
+              measurable: promise.measurable,
+              confidence: promise.confidence,
+            },
+          }),
+        });
+
+        const data = await res.json().catch(() => ({ ok: false, error: { message: "Failed to parse JSON response" } }));
+
+        if (!res.ok || (data.ok === false)) {
+          const errorMsg = data.error?.message || data.message || "Verifiering misslyckades";
+          return { success: false, error: errorMsg };
+        }
+
+        const verification = data.data?.verification || data.verification;
+        if (!verification || !verification.status) {
+          return { success: false, error: "Ogiltig verification struktur" };
+        }
+
+        // BUSINESS LOGIC: Använd verification-service för att uppdatera promise
+        const verifyResult = verifyPromise(standardPromise, verification, options);
+        if (!verifyResult.success || verifyResult.error) {
+          return { success: false, error: verifyResult.error?.message || "Verifiering misslyckades" };
+        }
+
+        return { success: true, verification: verifyResult.verification || undefined };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : "Verifiering misslyckades";
+        return { success: false, error: errorMsg };
+      }
+    };
+
+    // Batch-verifiering med concurrency control
+    const MAX_CONCURRENT = 3;
+    const DELAY_MS = 250;
+    let completed = 0;
+    const errors: Array<{ index: number; message: string }> = [];
+
+    // Skapa en kö av promises att verifiera
+    const queue = [...indexesToVerify];
+    const activePromises = new Set<Promise<void>>();
+
+    const processNext = async (): Promise<void> => {
+      while (queue.length > 0 || activePromises.size > 0) {
+        // Starta nya verifieringar om vi har plats och det finns i kön
+        while (activePromises.size < MAX_CONCURRENT && queue.length > 0) {
+          const promiseIndex = queue.shift()!;
+          
+          const verifyPromiseTask = verifySinglePromise(promiseIndex).then(async (result) => {
+            if (result.skipped) {
+              // Promise var redan verifierad, inget att göra
+              completed++;
+              setBulkProgress({ done: completed, total: indexesToVerify.length });
+              setVerifyingIndices((prev) => {
+                const newSet = new Set(prev);
+                newSet.delete(promiseIndex);
+                return newSet;
+              });
+              activePromises.delete(verifyPromiseTask);
+              return;
+            }
+
+            if (result.success && result.verification) {
+              // BUSINESS LOGIC: Använd verification-service för att uppdatera promise
+              const promise = promises[promiseIndex];
+              const standardPromise: StandardPromise = {
+                id: promiseIndex.toString(),
+                verified: promise.verified ?? false,
+                verifiedAt: promise.verifiedAt ?? null,
+                verifiedBy: promise.verifiedBy ?? null,
+                relatedKpiId: promise.relatedKpiId ?? null,
+                verification: result.verification,
+              };
+
+              const verifyResult = verifyPromise(standardPromise, result.verification, {
+                skipIfVerified: false, // Vi har redan verifierat, uppdatera bara
+                verifiedBy: "kpi",
+              });
+
+              // DATA LAYER: Uppdatera state
+              if (verifyResult.verification) {
+                setVerificationResults((prev) => {
+                  const newMap = new Map(prev);
+                  newMap.set(promiseIndex, verifyResult.verification!);
+                  return newMap;
+                });
+
+                // Uppdatera extractResponse med standardiserade fält
+                setExtractResponse((prev) => {
+                  if (!prev || !verifyResult.promise) return prev;
+                  const updatedPromises = prev.extraction.promises.map((p, idx) => {
+                    if (idx === promiseIndex) {
+                      return {
+                        ...p,
+                        verified: verifyResult.promise!.verified,
+                        verifiedAt: verifyResult.promise!.verifiedAt,
+                        verifiedBy: verifyResult.promise!.verifiedBy,
+                        relatedKpiId: verifyResult.promise!.relatedKpiId,
+                        verification: verifyResult.verification,
+                      };
+                    }
+                    return p;
+                  });
+                  return {
+                    ...prev,
+                    extraction: {
+                      ...prev.extraction,
+                      promises: updatedPromises,
+                    },
+                  };
+                });
+              }
+            } else {
+              // BUSINESS LOGIC: Normalisera fel via verification-service
+              const normalizedError = normalizeVerificationError(result.error);
+              const errorMessage = normalizedError?.message || result.error || "Okänt fel";
+              
+              // Spara fel
+              errors.push({
+                index: promiseIndex,
+                message: errorMessage,
+              });
+              
+              // DATA LAYER: Sätt ett default UNRESOLVED result
+              const defaultVerification: VerificationResult = {
+                status: "UNRESOLVED",
+                confidence: "low",
+                kpiUsed: null,
+                comparison: { before: null, after: null, deltaAbs: null, deltaPct: null },
+                notes: errorMessage,
+                reasoning: ["Ett fel uppstod vid verifieringen"],
+              };
+              
+              setVerificationResults((prev) => {
+                const newMap = new Map(prev);
+                newMap.set(promiseIndex, defaultVerification);
+                return newMap;
+              });
+            }
+
+            completed++;
+            setBulkProgress({ done: completed, total: indexesToVerify.length });
+            
+            // Ta bort från verifying indices
+            setVerifyingIndices((prev) => {
+              const newSet = new Set(prev);
+              newSet.delete(promiseIndex);
+              return newSet;
             });
-          }
-        });
-        return newMap;
-      });
 
-      // Uppdatera extractResponse med verifications så de finns lokalt
-      setExtractResponse((prev) => {
-        if (!prev) return prev;
-        const updatedPromises = prev.extraction.promises.map((p, idx) => {
-          const result = results.find((r: any) => r.promiseIndex === idx);
-          if (result) {
-            return {
-              ...p,
-              verification: {
-                status: result.status,
-                confidence: result.confidence,
-                kpiUsed: result.kpiUsed,
-                comparison: result.comparison,
-                notes: result.notes,
-                reasoning: result.reasoning || [],
-              },
-            };
-          }
-          return p;
-        });
-        return {
-          ...prev,
-          extraction: {
-            ...prev.extraction,
-            promises: updatedPromises,
-          },
-        };
-      });
+            activePromises.delete(verifyPromiseTask);
+          }).catch((err) => {
+            errors.push({
+              index: promiseIndex,
+              message: err instanceof Error ? err.message : "Unexpected error",
+            });
+            
+            completed++;
+            setBulkProgress({ done: completed, total: indexesToVerify.length });
+            
+            setVerifyingIndices((prev) => {
+              const newSet = new Set(prev);
+              newSet.delete(promiseIndex);
+              return newSet;
+            });
 
-      // Rensa valda promises
-      setSelectedPromiseIndices(new Set());
+            activePromises.delete(verifyPromiseTask);
+          });
+
+          activePromises.add(verifyPromiseTask);
+
+          // Delay mellan varje start (utom första)
+          if (queue.length > 0) {
+            await new Promise(resolve => setTimeout(resolve, DELAY_MS));
+          }
+        }
+
+        // Vänta på att någon verifiering ska slutföras
+        if (activePromises.size > 0) {
+          await Promise.race(Array.from(activePromises));
+        }
+      }
+    };
+
+    try {
+      await processNext();
+      
+      // Visa fel om några uppstod
+      if (errors.length > 0) {
+        setBulkErrors(errors);
+        const errorSummary = `${errors.length} av ${indexesToVerify.length} verifieringar misslyckades.`;
+        addDebugError("verify", new Error(errorSummary));
+      }
+
+      // Rensa valda promises om allt gick bra
+      if (errors.length === 0) {
+        setSelectedPromiseIndices(new Set());
+      }
     } catch (err) {
       addDebugError("verify", err);
     } finally {
       setBatchVerifying(false);
+      setBulkProgress(null);
       setVerifyingIndices((prev) => {
         const newSet = new Set(prev);
         indexesToVerify.forEach((idx) => newSet.delete(idx));
@@ -962,6 +1376,8 @@ export default function CompanyPage() {
     setSelectedVerification(null);
     setSelectedPromiseIndices(new Set());
     setBatchVerifying(false);
+    setBulkProgress(null);
+    setBulkErrors([]);
     setCompanyScore(null);
   }, []);
 
@@ -1611,7 +2027,9 @@ export default function CompanyPage() {
                         fontSize: "0.875rem",
                       }}
                     >
-                      {batchVerifying ? "Verifierar..." : "Verifiera alla (KPI)"}
+                      {batchVerifying 
+                        ? (bulkProgress ? `Verifierar ${bulkProgress.done} / ${bulkProgress.total}` : "Verifierar...")
+                        : "Verifiera alla (KPI)"}
                     </button>
                     <button
                       onClick={() => handleBatchVerify(Array.from(selectedPromiseIndices))}
@@ -1627,8 +2045,41 @@ export default function CompanyPage() {
                         fontSize: "0.875rem",
                       }}
                     >
-                      {batchVerifying ? "Verifierar..." : `Verifiera valda (${selectedPromiseIndices.size})`}
+                      {batchVerifying 
+                        ? (bulkProgress ? `Verifierar ${bulkProgress.done} / ${bulkProgress.total}` : "Verifierar...")
+                        : `Verifiera valda (${selectedPromiseIndices.size})`}
                     </button>
+                    {bulkProgress && (
+                      <div style={{
+                        marginTop: "0.5rem",
+                        fontSize: "0.875rem",
+                        color: "var(--text-secondary)",
+                      }}>
+                        Progress: {bulkProgress.done} / {bulkProgress.total} ({Math.round((bulkProgress.done / bulkProgress.total) * 100)}%)
+                      </div>
+                    )}
+                    {bulkErrors.length > 0 && (
+                      <div style={{
+                        marginTop: "0.5rem",
+                        padding: "0.5rem",
+                        backgroundColor: "var(--error-bg, rgba(239, 68, 68, 0.1))",
+                        borderRadius: "0.375rem",
+                        fontSize: "0.875rem",
+                        color: "var(--error-text, #ef4444)",
+                      }}>
+                        <strong>{bulkErrors.length} verifieringar misslyckades:</strong>
+                        <ul style={{ margin: "0.25rem 0 0 0", paddingLeft: "1.5rem" }}>
+                          {bulkErrors.slice(0, 5).map((err, idx) => (
+                            <li key={idx}>
+                              Promise #{err.index}: {err.message}
+                            </li>
+                          ))}
+                          {bulkErrors.length > 5 && (
+                            <li>... och {bulkErrors.length - 5} fler</li>
+                          )}
+                        </ul>
+                      </div>
+                    )}
                     <button
                       onClick={handleSelectAllVerifiable}
                       disabled={batchVerifying}
