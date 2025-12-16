@@ -10,6 +10,9 @@
  * - Beräkning av Operating Margin för MARGIN promises
  * - Stöd för FCF och EPS verification
  * - Automatisk KPI-baserad verifiering för UNCLEAR promises
+ * - Fuzzy matching för KPI-keys
+ * - Inferera promise type från text
+ * - Förbättrad logging
  */
 
 import { ExtractedKpi, KpiExtractionResult, getKpiHistory } from "./kpis";
@@ -104,32 +107,33 @@ interface KpiMappingConfig {
     incomeKey: string;
     label: string;
   };
+  fuzzyMatch?: string[]; // Keywords för fuzzy matching mot KPI-keys
 }
 
 const PROMISE_TYPE_TO_KPI: Record<string, KpiMappingConfig> = {
   REVENUE: {
     primary: ["revenue", "netSales"],
+    fuzzyMatch: ["revenue", "sales", "netsales"],
   },
   DEBT: {
     primary: ["totalDebt"],
-    fallbacks: ["longTermDebt"], // Fallback om totalDebt saknas
+    fallbacks: ["longTermDebt"],
+    fuzzyMatch: ["debt"],
   },
   CAPEX: {
     primary: ["capex"],
+    fuzzyMatch: ["capex", "propertyplantandequipment", "paymentstoacquire"],
   },
   FCF: {
-    primary: ["fcf"], // Free Cash Flow (beräknas i kpis.ts från CFO - CapEx)
+    primary: ["fcf"],
+    fuzzyMatch: ["fcf", "freecashflow"],
   },
   COSTS: {
-    // För COSTS: använd operatingExpenses eller COGS
     primary: ["operatingExpenses", "cogs"],
-    // Fallback: om operatingExpenses saknas, kan vi använda operatingIncome som proxy
-    // (om operatingIncome ökar = relativa costs minskar = SUPPORTED)
     fallbacks: ["operatingIncome"],
+    fuzzyMatch: ["operatingexpense", "costofrevenue", "cogs", "cost"],
   },
   MARGIN: {
-    // För MARGIN: försök beräkna Operating Margin först (Revenue + OperatingIncome)
-    // Fallback: använd direkt OperatingIncome eller GrossProfit
     primary: ["operatingIncome", "grossProfit"],
     calculated: {
       type: "margin",
@@ -137,22 +141,26 @@ const PROMISE_TYPE_TO_KPI: Record<string, KpiMappingConfig> = {
       incomeKey: "operatingIncome",
       label: "Operating Margin",
     },
+    fuzzyMatch: ["margin", "grossmargin", "operatingmargin"],
   },
   EPS: {
     primary: ["epsBasic"],
     fallbacks: ["epsDiluted"],
+    fuzzyMatch: ["eps", "earningspershare"],
   },
   STRATEGY: {
-    primary: [], // Ingen direkt KPI-mapping
+    primary: [],
   },
   PRODUCT: {
-    primary: ["revenue", "netSales"], // Produkt-promises kan verifieras mot revenue
+    primary: ["revenue", "netSales"],
+    fuzzyMatch: ["revenue", "sales"],
   },
   MARKET: {
-    primary: ["revenue", "netSales"], // Market-promises kan verifieras mot revenue
+    primary: ["revenue", "netSales"],
+    fuzzyMatch: ["revenue", "sales"],
   },
   OTHER: {
-    primary: [], // Ingen direkt KPI-mapping
+    primary: [],
   },
 };
 
@@ -176,7 +184,6 @@ const KPI_DIRECTION_POSITIVE: Record<string, boolean> = {
   cash: true,
   epsBasic: true,
   epsDiluted: true,
-  // För beräknade margins: ökning är positivt
   operatingMargin: true,
   grossMargin: true,
 };
@@ -184,6 +191,64 @@ const KPI_DIRECTION_POSITIVE: Record<string, boolean> = {
 // ============================================
 // HELPER FUNCTIONS
 // ============================================
+
+/**
+ * Infererar promise type från text med keywords.
+ */
+function inferPromiseTypeFromText(text: string): PromiseType | null {
+  const lower = text.toLowerCase();
+  
+  // REVENUE keywords
+  if (lower.match(/\b(revenue|sales|revenues|netsales|top.?line)\b/)) {
+    return "REVENUE";
+  }
+  
+  // MARGIN keywords
+  if (lower.match(/\b(margin|gross.?margin|operating.?margin|profitability)\b/)) {
+    return "MARGIN";
+  }
+  
+  // CAPEX keywords
+  if (lower.match(/\b(capex|capital.?expenditure|invest|property|plant|equipment|infrastructure)\b/)) {
+    return "CAPEX";
+  }
+  
+  // COSTS keywords
+  if (lower.match(/\b(cost|expense|efficiency|operating.?expense|cogs|cost.?of.?revenue)\b/)) {
+    return "COSTS";
+  }
+  
+  // DEBT keywords
+  if (lower.match(/\b(debt|leverage|borrowing|liability)\b/)) {
+    return "DEBT";
+  }
+  
+  return null;
+}
+
+/**
+ * Fuzzy match KPI-keys baserat på keywords (case-insensitive, contains).
+ */
+function findKpiByFuzzyMatch(
+  kpiResult: KpiExtractionResult,
+  keywords: string[]
+): ExtractedKpi[] {
+  const matched: ExtractedKpi[] = [];
+  const availableKeys = Array.from(new Set(kpiResult.kpis.map(k => k.key)));
+  
+  for (const keyword of keywords) {
+    const lowerKeyword = keyword.toLowerCase();
+    for (const kpiKey of availableKeys) {
+      const lowerKey = kpiKey.toLowerCase();
+      if (lowerKey.includes(lowerKeyword) || lowerKeyword.includes(lowerKey)) {
+        const kpis = kpiResult.kpis.filter(k => k.key === kpiKey);
+        matched.push(...kpis);
+      }
+    }
+  }
+  
+  return matched;
+}
 
 /**
  * Hittar de två senaste datapunkterna för en KPI.
@@ -305,6 +370,77 @@ function calculateMarginDataPoints(
 }
 
 /**
+ * Beräknar Gross Margin proxy från Revenue och COGS.
+ */
+function calculateGrossMarginProxy(
+  kpiResult: KpiExtractionResult,
+  preferAnnual: boolean = true
+): { before: { value: number; period: string; unit: string; filedDate: string } | null; after: { value: number; period: string; unit: string; filedDate: string } | null } {
+  const revenueHistory = getKpiHistory(
+    kpiResult,
+    "revenue",
+    preferAnnual ? "annual" : undefined
+  );
+  
+  const cogsHistory = getKpiHistory(
+    kpiResult,
+    "cogs",
+    preferAnnual ? "annual" : undefined
+  );
+
+  if (revenueHistory.length === 0 || cogsHistory.length === 0) {
+    return { before: null, after: null };
+  }
+
+  const matched: Array<{ revenue: ExtractedKpi; cogs: ExtractedKpi; margin: number }> = [];
+  
+  for (const rev of revenueHistory) {
+    const matchingCogs = cogsHistory.find(
+      c => c.fiscalYear === rev.fiscalYear && c.fiscalPeriod === rev.fiscalPeriod
+    );
+    
+    if (matchingCogs && rev.value !== 0) {
+      const margin = ((rev.value - Math.abs(matchingCogs.value)) / rev.value) * 100;
+      matched.push({
+        revenue: rev,
+        cogs: matchingCogs,
+        margin,
+      });
+    }
+  }
+
+  if (matched.length === 0) {
+    return { before: null, after: null };
+  }
+
+  matched.sort((a, b) => {
+    if (a.revenue.fiscalYear !== b.revenue.fiscalYear) {
+      return b.revenue.fiscalYear - a.revenue.fiscalYear;
+    }
+    const periodOrder: Record<string, number> = { FY: 0, Q4: 1, Q3: 2, Q2: 3, Q1: 4 };
+    return (periodOrder[a.revenue.fiscalPeriod] ?? 5) - (periodOrder[b.revenue.fiscalPeriod] ?? 5);
+  });
+
+  const after = matched[0];
+  const before = matched.length > 1 ? matched[1] : null;
+
+  return {
+    after: {
+      value: after.margin,
+      period: after.revenue.period,
+      unit: "%",
+      filedDate: after.revenue.filedDate,
+    },
+    before: before ? {
+      value: before.margin,
+      period: before.revenue.period,
+      unit: "%",
+      filedDate: before.revenue.filedDate,
+    } : null,
+  };
+}
+
+/**
  * Beräknar delta mellan två värden.
  */
 function calculateDelta(
@@ -363,17 +499,19 @@ function findKpiKeysForPromiseType(promiseType: string): string[] {
 
 /**
  * Hittar första tillgängliga KPI med data för en lista av KPI-nycklar.
+ * Använder fuzzy matching om exakt matchning misslyckas.
  */
 function findFirstAvailableKpi(
   kpiResult: KpiExtractionResult,
   kpiKeys: string[],
-  preferAnnual: boolean = true
+  preferAnnual: boolean = true,
+  fuzzyKeywords?: string[]
 ): { key: string; label: string; dataPoints: { before: ExtractedKpi | null; after: ExtractedKpi | null } } | null {
+  // Steg 1: Försök exakt matchning
   for (const kpiKey of kpiKeys) {
     const dataPoints = findKpiDataPoints(kpiResult, kpiKey, preferAnnual);
     
     if (dataPoints.after) {
-      // Hitta label från KPI-resultatet
       const kpiSample = kpiResult.kpis.find(k => k.key === kpiKey);
       const label = kpiSample?.label || kpiKey;
       
@@ -382,6 +520,33 @@ function findFirstAvailableKpi(
         label,
         dataPoints,
       };
+    }
+  }
+  
+  // Steg 2: Om ingen exakt match, försök fuzzy matching
+  if (fuzzyKeywords && fuzzyKeywords.length > 0) {
+    const fuzzyMatches = findKpiByFuzzyMatch(kpiResult, fuzzyKeywords);
+    if (fuzzyMatches.length > 0) {
+      // Gruppera efter key och ta första med data
+      const keyGroups = new Map<string, ExtractedKpi[]>();
+      for (const kpi of fuzzyMatches) {
+        if (!keyGroups.has(kpi.key)) {
+          keyGroups.set(kpi.key, []);
+        }
+        keyGroups.get(kpi.key)!.push(kpi);
+      }
+      
+      for (const [fuzzyKey, kpis] of keyGroups.entries()) {
+        const dataPoints = findKpiDataPoints(kpiResult, fuzzyKey, preferAnnual);
+        if (dataPoints.after) {
+          const kpiSample = kpis[0];
+          return {
+            key: fuzzyKey,
+            label: kpiSample.label || fuzzyKey,
+            dataPoints,
+          };
+        }
+      }
     }
   }
   
@@ -394,16 +559,6 @@ function findFirstAvailableKpi(
 
 /**
  * Automatisk KPI-baserad verifiering för promises med status "UNCLEAR".
- * 
- * För varje promise med score.status = "UNCLEAR":
- * 1) Identifiera KPI-typ baserat på promise.type
- * 2) Jämför senaste FY mot föregående FY
- * 3) Sätt verification baserat på POSITIVE/NEGATIVE
- * 4) Uppdatera promise.score med ny status, verifiedBy, comparedKpi, delta, verifiedAt
- * 
- * @param promises - Array av promises med score (endast UNCLEAR kommer att verifieras)
- * @param kpiResult - KPI-data från XBRL
- * @returns Uppdaterade promises med nya score-statusar
  */
 export function autoVerifyUnclearPromises(
   promises: PromiseWithScore[],
@@ -412,29 +567,23 @@ export function autoVerifyUnclearPromises(
   const updatedPromises: PromiseWithScore[] = [];
 
   for (const promise of promises) {
-    // Hoppa över om promise inte har score eller om status inte är UNCLEAR
     if (!promise.score || promise.score.status !== "UNCLEAR") {
       updatedPromises.push(promise);
       continue;
     }
 
     try {
-      // Steg 1: Identifiera KPI-typ baserat på promise.type
       const mapping = PROMISE_TYPE_TO_KPI[promise.type];
       
       if (!mapping || mapping.primary.length === 0) {
-        // Ingen KPI-mapping för denna typ - behåll UNCLEAR
         updatedPromises.push(promise);
         continue;
       }
 
-      // Steg 2: Försök hitta KPI-data
       let bestKpiKey: string | null = null;
       let bestLabel: string = "";
       let bestDataPoints: { before: ExtractedKpi | null; after: ExtractedKpi | null } | null = null;
-      let isCalculatedMargin = false;
 
-      // Steg 2a: Försök med beräknad margin för MARGIN promises
       if (promise.type === "MARGIN" && mapping.calculated) {
         const marginData = calculateMarginDataPoints(
           kpiResult,
@@ -472,14 +621,17 @@ export function autoVerifyUnclearPromises(
               form: "10-K",
             },
           };
-          isCalculatedMargin = true;
         }
       }
 
-      // Steg 2b: Om ingen beräknad margin hittades, prova direkta KPIs
       if (!bestDataPoints || !bestDataPoints.after || !bestDataPoints.before) {
         const kpiKeys = findKpiKeysForPromiseType(promise.type);
-        const found = findFirstAvailableKpi(kpiResult, kpiKeys, true);
+        const found = findFirstAvailableKpi(
+          kpiResult, 
+          kpiKeys, 
+          true,
+          mapping.fuzzyMatch
+        );
         
         if (found && found.dataPoints.after && found.dataPoints.before) {
           bestKpiKey = found.key;
@@ -488,24 +640,20 @@ export function autoVerifyUnclearPromises(
         }
       }
 
-      // Steg 3: Om ingen data hittades med både before och after, behåll UNCLEAR
       if (!bestKpiKey || !bestDataPoints || !bestDataPoints.after || !bestDataPoints.before) {
         updatedPromises.push(promise);
         continue;
       }
 
-      // Steg 4: Jämför senaste FY mot föregående FY
       const { deltaAbs, deltaPct } = calculateDelta(
         bestDataPoints.before.value,
         bestDataPoints.after.value
       );
 
-      // Steg 5: Avgör om förändringen är POSITIVE eller NEGATIVE
       const isIncreasePositive = KPI_DIRECTION_POSITIVE[bestKpiKey] ?? true;
       const valueIncreased = deltaAbs > 0;
       const isPositiveChange = isIncreasePositive ? valueIncreased : !valueIncreased;
 
-      // Steg 6: Detektera om promise är positiv (increase/grow) eller negativ (decrease/reduce)
       const promiseTextLower = promise.text.toLowerCase();
       const isPositiveClaim = 
         ["increase", "increases", "increasing", "grow", "grows", "growing", "raise", "raises", "rising", "improve", "improves", "improving", "expand", "expanding", "higher", "up", "double", "triple"].some(
@@ -516,11 +664,9 @@ export function autoVerifyUnclearPromises(
           keyword => promiseTextLower.includes(keyword)
         );
 
-      // Steg 7: Sätt verification status
       let newStatus: "HELD" | "MIXED" | "FAILED" | "UNCLEAR" = "UNCLEAR";
 
       if (isPositiveClaim) {
-        // Positiv claim (t.ex. "increase revenue")
         if (isPositiveChange && Math.abs(deltaPct) >= 1) {
           newStatus = "HELD";
         } else if (!isPositiveChange && Math.abs(deltaPct) >= 1) {
@@ -529,9 +675,7 @@ export function autoVerifyUnclearPromises(
           newStatus = "MIXED";
         }
       } else if (isNegativeClaim) {
-        // Negativ claim (t.ex. "reduce costs")
         if (!isPositiveChange && Math.abs(deltaPct) >= 1) {
-          // För costs: minskning är positivt
           newStatus = "HELD";
         } else if (isPositiveChange && Math.abs(deltaPct) >= 1) {
           newStatus = "FAILED";
@@ -539,7 +683,6 @@ export function autoVerifyUnclearPromises(
           newStatus = "MIXED";
         }
       } else {
-        // Ingen tydlig riktning i claim - sätt MIXED om förändring är signifikant
         if (Math.abs(deltaPct) >= 5) {
           newStatus = "MIXED";
         } else {
@@ -547,7 +690,6 @@ export function autoVerifyUnclearPromises(
         }
       }
 
-      // Steg 8: Uppdatera promise.score
       const updatedPromise: PromiseWithScore = {
         ...promise,
         score: {
@@ -572,7 +714,6 @@ export function autoVerifyUnclearPromises(
 
       updatedPromises.push(updatedPromise);
     } catch (error) {
-      // Om något går fel, behåll original promise
       console.error(`[autoVerify] Error verifying promise:`, error);
       updatedPromises.push(promise);
     }
@@ -586,16 +727,7 @@ export function autoVerifyUnclearPromises(
 // ============================================
 
 /**
- * Verifierar en promise mot KPI-data med förbättrad mapping.
- * 
- * Regelbaserad MVP:
- * - REVENUE: SUPPORTED om after > before
- * - DEBT: SUPPORTED om after < before (minskat skuld)
- * - CAPEX: SUPPORTED om after > before (ökad investering)
- * - FCF: SUPPORTED om after > before
- * - COSTS: SUPPORTED om operatingIncome ökar (relativa costs minskar)
- * - MARGIN: SUPPORTED om margin ökar (kan beräknas från Revenue + OperatingIncome)
- * - EPS: SUPPORTED om after > before
+ * Verifierar en promise mot KPI-data med förbättrad mapping och fuzzy matching.
  */
 export function verifyPromiseWithKpis(
   promise: PromiseForVerification,
@@ -603,11 +735,20 @@ export function verifyPromiseWithKpis(
 ): VerificationResult {
   const reasoning: string[] = [];
   
-  const mapping = PROMISE_TYPE_TO_KPI[promise.type];
+  // Försök inferera type om OTHER eller saknas
+  let promiseType = promise.type;
+  if (promiseType === "OTHER" || !promiseType) {
+    const inferred = inferPromiseTypeFromText(promise.text);
+    if (inferred) {
+      promiseType = inferred;
+      reasoning.push(`Infererade promise type: ${inferred} från text`);
+    }
+  }
   
-  // Steg 1: Kolla om promise-typen har KPI-mapping
+  const mapping = PROMISE_TYPE_TO_KPI[promiseType];
+  
   if (!mapping || mapping.primary.length === 0) {
-    reasoning.push(`Promise-typ ${promise.type} har ingen direkt KPI-mapping`);
+    reasoning.push(`Promise-typ ${promiseType} har ingen direkt KPI-mapping`);
     return {
       status: "UNRESOLVED",
       confidence: "low",
@@ -618,19 +759,17 @@ export function verifyPromiseWithKpis(
         deltaAbs: null,
         deltaPct: null,
       },
-      notes: `Relevant KPI saknas i XBRL-data för att verifiera ${promise.type}-promises. Ingen KPI-mapping definierad för denna typ.`,
+      notes: `Relevant KPI saknas i XBRL-data för att verifiera ${promiseType}-promises. Ingen KPI-mapping definierad för denna typ.`,
       reasoning,
     };
   }
 
-  // Steg 2: Försök hitta KPI-data
   let bestKpiKey: string | null = null;
   let bestLabel: string = "";
   let bestDataPoints: { before: ExtractedKpi | null; after: ExtractedKpi | null } | null = null;
-  let isCalculatedMargin = false;
 
-  // Steg 2a: Försök med beräknad margin för MARGIN promises
-  if (promise.type === "MARGIN" && mapping.calculated) {
+  // Steg 1: Försök med beräknad margin för MARGIN promises
+  if (promiseType === "MARGIN" && mapping.calculated) {
     const marginData = calculateMarginDataPoints(
       kpiResult,
       mapping.calculated.revenueKey,
@@ -638,11 +777,11 @@ export function verifyPromiseWithKpis(
       true
     );
     
-    if (marginData.after) {
+    if (marginData.after && marginData.before) {
       bestKpiKey = "operatingMargin";
       bestLabel = mapping.calculated.label;
       bestDataPoints = {
-        after: marginData.after ? {
+        after: {
           key: "operatingMargin",
           label: bestLabel,
           period: marginData.after.period,
@@ -653,8 +792,8 @@ export function verifyPromiseWithKpis(
           fiscalYear: 0,
           fiscalPeriod: "FY",
           form: "10-K",
-        } : null,
-        before: marginData.before ? {
+        },
+        before: {
           key: "operatingMargin",
           label: bestLabel,
           period: marginData.before.period,
@@ -665,17 +804,55 @@ export function verifyPromiseWithKpis(
           fiscalYear: 0,
           fiscalPeriod: "FY",
           form: "10-K",
-        } : null,
+        },
       };
-      isCalculatedMargin = true;
       reasoning.push(`Beräknade ${bestLabel} från Revenue och Operating Income`);
+    } else {
+      // Försök Gross Margin proxy
+      const grossMarginData = calculateGrossMarginProxy(kpiResult, true);
+      if (grossMarginData.after && grossMarginData.before) {
+        bestKpiKey = "grossMargin";
+        bestLabel = "Gross Margin (proxy)";
+        bestDataPoints = {
+          after: {
+            key: "grossMargin",
+            label: bestLabel,
+            period: grossMarginData.after.period,
+            periodType: "annual",
+            value: grossMarginData.after.value,
+            unit: grossMarginData.after.unit,
+            filedDate: grossMarginData.after.filedDate,
+            fiscalYear: 0,
+            fiscalPeriod: "FY",
+            form: "10-K",
+          },
+          before: {
+            key: "grossMargin",
+            label: bestLabel,
+            period: grossMarginData.before.period,
+            periodType: "annual",
+            value: grossMarginData.before.value,
+            unit: grossMarginData.before.unit,
+            filedDate: grossMarginData.before.filedDate,
+            fiscalYear: 0,
+            fiscalPeriod: "FY",
+            form: "10-K",
+          },
+        };
+        reasoning.push(`Beräknade ${bestLabel} från Revenue och COGS`);
+      }
     }
   }
 
-  // Steg 2b: Om ingen beräknad margin hittades, prova direkta KPIs
+  // Steg 2: Om ingen beräknad margin, prova direkta KPIs med fuzzy matching
   if (!bestDataPoints || !bestDataPoints.after) {
-    const kpiKeys = findKpiKeysForPromiseType(promise.type);
-    const found = findFirstAvailableKpi(kpiResult, kpiKeys, true);
+    const kpiKeys = findKpiKeysForPromiseType(promiseType);
+    const found = findFirstAvailableKpi(
+      kpiResult, 
+      kpiKeys, 
+      true,
+      mapping.fuzzyMatch
+    );
     
     if (found) {
       bestKpiKey = found.key;
@@ -685,13 +862,12 @@ export function verifyPromiseWithKpis(
     }
   }
 
-  // Steg 3: Om ingen data hittades, returnera UNRESOLVED med tydlig feedback
+  // Steg 3: Om ingen data hittades, returnera UNRESOLVED
   if (!bestKpiKey || !bestDataPoints || !bestDataPoints.after) {
-    const kpiKeys = findKpiKeysForPromiseType(promise.type);
+    const kpiKeys = findKpiKeysForPromiseType(promiseType);
     const triedKeys = kpiKeys.length > 0 ? kpiKeys.join(", ") : "ingen";
     reasoning.push(`Ingen KPI-data hittades för nycklar: ${triedKeys}`);
     
-    // Lista tillgängliga KPIs för debugging
     const availableKeys = Array.from(new Set(kpiResult.kpis.map(k => k.key))).slice(0, 10).join(", ");
     
     return {
@@ -704,12 +880,11 @@ export function verifyPromiseWithKpis(
         deltaAbs: null,
         deltaPct: null,
       },
-      notes: `Relevant KPI saknas i XBRL-data för ${promise.type}. Försökte hitta: ${triedKeys}. Tillgängliga KPIs i data: ${availableKeys || "inga"}.`,
+      notes: `Relevant KPI saknas i XBRL-data för ${promiseType}. Försökte hitta: ${triedKeys}. Tillgängliga KPIs i data: ${availableKeys || "inga"}.`,
       reasoning,
     };
   }
 
-  // Steg 4: Bygg comparison-objekt
   const comparison: KpiComparison = {
     before: bestDataPoints.before ? {
       period: bestDataPoints.before.period,
@@ -727,7 +902,6 @@ export function verifyPromiseWithKpis(
     deltaPct: null,
   };
 
-  // Steg 5: Om endast senaste värde finns, returnera PENDING
   if (!bestDataPoints.before) {
     reasoning.push(`Endast senaste värde tillgängligt (${bestDataPoints.after.period})`);
     return {
@@ -743,7 +917,6 @@ export function verifyPromiseWithKpis(
     };
   }
 
-  // Steg 6: Beräkna delta och avgör status
   const { deltaAbs, deltaPct } = calculateDelta(
     bestDataPoints.before.value,
     bestDataPoints.after.value
@@ -756,16 +929,12 @@ export function verifyPromiseWithKpis(
   const isIncreasePositive = KPI_DIRECTION_POSITIVE[bestKpiKey] ?? true;
   const valueIncreased = deltaAbs > 0;
   
-  // Steg 7: Särskild hantering för COSTS promises
-  // För COSTS: om operatingIncome ökar = relativ costs minskar = SUPPORTED
-  const isCostsPromise = promise.type === "COSTS";
+  const isCostsPromise = promiseType === "COSTS";
   
   let status: VerificationStatus;
   let statusNote: string;
 
   if (isCostsPromise) {
-    // För COSTS använder vi operatingIncome som proxy
-    // Om operating income ökar, betyder det att costs minskat relativt till revenue = SUPPORTED
     if (valueIncreased && deltaPct > 0) {
       status = "SUPPORTED";
       statusNote = `${bestLabel} ökade med ${deltaPct.toFixed(2)}%, vilket indikerar förbättrad kostnadseffektivitet (lägre relativa kostnader).`;
@@ -777,7 +946,6 @@ export function verifyPromiseWithKpis(
       statusNote = `${bestLabel} nästan oförändrad (${deltaPct.toFixed(2)}%).`;
     }
   } else {
-    // Standard logik för andra promise-typer
     const isPositiveChange = isIncreasePositive ? valueIncreased : !valueIncreased;
     
     if (isPositiveChange && Math.abs(deltaPct) >= 1) {
@@ -794,7 +962,6 @@ export function verifyPromiseWithKpis(
 
   reasoning.push(statusNote);
 
-  // Steg 8: Bestäm confidence
   const sameUnit = bestDataPoints.before.unit === bestDataPoints.after.unit;
   const isAnnualData = bestDataPoints.after.periodType === "annual";
   
@@ -819,17 +986,51 @@ export function verifyPromiseWithKpis(
 }
 
 /**
- * Batch-verifierar flera promises mot KPI-data.
+ * Batch-verifierar flera promises mot KPI-data med logging.
  */
 export function verifyMultiplePromises(
   promises: PromiseForVerification[],
   kpiResult: KpiExtractionResult
 ): Map<number, VerificationResult> {
+  console.log(`[verify] Starting batch verification: ${promises.length} promises`);
+  
+  // Räkna promise types
+  const typeCounts: Record<string, number> = {};
+  promises.forEach(p => {
+    const type = p.type || "UNKNOWN";
+    typeCounts[type] = (typeCounts[type] || 0) + 1;
+  });
+  
+  const topTypes = Object.entries(typeCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([type, count]) => `${type}:${count}`)
+    .join(", ");
+  console.log(`[verify] Promise types (top 10): ${topTypes}`);
+  
   const results = new Map<number, VerificationResult>();
+  let matchedCount = 0;
+  const statusCounts = {
+    SUPPORTED: 0,
+    CONTRADICTED: 0,
+    UNRESOLVED: 0,
+    PENDING: 0,
+  };
   
   for (let i = 0; i < promises.length; i++) {
-    results.set(i, verifyPromiseWithKpis(promises[i], kpiResult));
+    const result = verifyPromiseWithKpis(promises[i], kpiResult);
+    results.set(i, result);
+    
+    if (result.kpiUsed) {
+      matchedCount++;
+    }
+    statusCounts[result.status]++;
   }
+  
+  console.log(`[verify] Verification complete:`);
+  console.log(`[verify]   Total promises: ${promises.length}`);
+  console.log(`[verify]   Matched KPI: ${matchedCount}`);
+  console.log(`[verify]   Result counts: SUPPORTED=${statusCounts.SUPPORTED}, CONTRADICTED=${statusCounts.CONTRADICTED}, UNRESOLVED=${statusCounts.UNRESOLVED}, PENDING=${statusCounts.PENDING}`);
   
   return results;
 }

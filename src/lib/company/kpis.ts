@@ -58,6 +58,13 @@ const KPI_DEFINITIONS: KpiDefinition[] = [
     description: "Total revenue/sales",
   },
   {
+    key: "netSales",
+    label: "Net Sales",
+    tags: ["SalesRevenueNet", "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"],
+    unit: "USD",
+    description: "Net sales",
+  },
+  {
     key: "netIncome",
     label: "Net Income",
     tags: ["NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"],
@@ -133,6 +140,20 @@ const KPI_DEFINITIONS: KpiDefinition[] = [
     tags: ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"],
     unit: "USD",
     description: "Capital expenditures",
+  },
+  {
+    key: "operatingExpenses",
+    label: "Operating Expenses",
+    tags: ["OperatingExpenses", "CostsAndExpenses", "OperatingCostsAndExpenses"],
+    unit: "USD",
+    description: "Operating expenses",
+  },
+  {
+    key: "cogs",
+    label: "Cost of Goods Sold",
+    tags: ["CostOfGoodsAndServicesSold", "CostOfRevenue", "CostOfSales"],
+    unit: "USD",
+    description: "Cost of goods sold / Cost of revenue",
   },
   {
     key: "totalAssets",
@@ -284,9 +305,23 @@ function deduplicateByPeriod(units: FactUnit[]): FactUnit[] {
 export function extractKpisFromCompanyFacts(
   factsJson: CompanyFactsResponse
 ): KpiExtractionResult {
+  console.log("[xbrl] Starting KPI extraction from Company Facts");
+  
   const kpis: ExtractedKpi[] = [];
   const coveredYears = new Set<number>();
   let latestFiledDate = "";
+  
+  // Samla alla faktiska tag-namn från XBRL för logging
+  const allAvailableTags: string[] = [];
+  const usGaap = factsJson.facts?.["us-gaap"];
+  if (usGaap) {
+    Object.keys(usGaap).forEach(tag => {
+      allAvailableTags.push(tag);
+    });
+  }
+  
+  console.log(`[xbrl] Total available XBRL tags: ${allAvailableTags.length}`);
+  console.log(`[xbrl] Top 30 XBRL tag keys:`, allAvailableTags.slice(0, 30));
 
   // Extrahera varje KPI
   for (const def of KPI_DEFINITIONS) {
@@ -299,17 +334,20 @@ export function extractKpisFromCompanyFacts(
     units = sortByDate(units);
     units = deduplicateByPeriod(units);
 
-    // Ta max 8 perioder per KPI (senaste 2 år kvartal + årliga)
-    const limitedUnits = units.slice(0, 8);
+    if (units.length === 0) continue;
 
-    for (const unit of limitedUnits) {
+    // Extrahera varje datapunkt
+    for (const unit of units) {
+      const periodType = getPeriodType(unit.fp);
+      const period = formatPeriod(unit);
+      
       kpis.push({
         key: def.key,
         label: def.label,
-        period: formatPeriod(unit),
-        periodType: getPeriodType(unit.fp),
+        period,
+        periodType,
         value: unit.val,
-        unit: def.unit,
+        unit: def.unit === "USD" ? "USD" : def.unit === "shares" ? "shares" : "USD/share",
         filedDate: unit.filed,
         fiscalYear: unit.fy,
         fiscalPeriod: unit.fp,
@@ -365,55 +403,38 @@ export function extractKpisFromCompanyFacts(
     return (periodOrder[a.fiscalPeriod] ?? 5) - (periodOrder[b.fiscalPeriod] ?? 5);
   });
 
-  // Begränsa till max 50 KPIs
-  const limitedKpis = kpis.slice(0, 50);
+  // Logga perioder som finns
+  const periods = new Set<string>();
+  kpis.forEach(k => {
+    periods.add(`${k.fiscalYear}-${k.fiscalPeriod}`);
+  });
+  const sortedPeriods = Array.from(periods).sort().reverse();
+  console.log(`[xbrl] Available periods (FY/Q):`, sortedPeriods.slice(0, 10));
+  
+  // Logga unika KPI-keys som faktiskt extraherades
+  const extractedKeys = Array.from(new Set(kpis.map(k => k.key)));
+  console.log(`[xbrl] Extracted KPI keys (${extractedKeys.length}):`, extractedKeys);
+  console.log(`[xbrl] Total KPI data points: ${kpis.length}`);
 
-  // Beräkna unika metrics
-  const uniqueMetrics = new Set(limitedKpis.map(k => k.key)).size;
+  const uniqueMetrics = new Set(kpis.map(k => k.key)).size;
+  const coverageYearsArray = Array.from(coveredYears).sort((a, b) => b - a);
 
   return {
-    cik: factsJson.cik.toString().padStart(10, "0"),
-    companyName: factsJson.entityName,
-    asOf: new Date().toISOString().split("T")[0],
-    kpis: limitedKpis,
+    cik: factsJson.cik?.toString().padStart(10, "0") || "",
+    companyName: factsJson.entityName || "",
+    asOf: latestFiledDate || new Date().toISOString().split("T")[0],
+    kpis,
     summary: {
-      totalKpis: limitedKpis.length,
+      totalKpis: kpis.length,
       uniqueMetrics,
       latestFilingDate: latestFiledDate,
-      coverageYears: Array.from(coveredYears).sort((a, b) => b - a),
+      coverageYears: coverageYearsArray,
     },
   };
 }
 
 /**
- * Hämtar senaste värde för en specifik KPI.
- */
-export function getLatestKpiValue(
-  result: KpiExtractionResult,
-  key: string,
-  periodType?: "annual" | "quarterly"
-): ExtractedKpi | null {
-  const filtered = result.kpis.filter(k => {
-    if (k.key !== key) return false;
-    if (periodType && k.periodType !== periodType) return false;
-    return true;
-  });
-  
-  if (filtered.length === 0) return null;
-  
-  // Redan sorterad nyast först
-  return filtered[0];
-}
-
-/**
- * Formaterar KPI-värde för visning.
- */
-export function formatKpiValue(kpi: ExtractedKpi): string {
-  return formatValue(kpi.value, kpi.unit);
-}
-
-/**
- * Hämtar KPI-historik för en specifik metric.
+ * Hämtar historik för en specifik KPI.
  */
 export function getKpiHistory(
   result: KpiExtractionResult,
@@ -426,4 +447,3 @@ export function getKpiHistory(
     return true;
   });
 }
-
