@@ -23,6 +23,7 @@ import { FieldValue } from "firebase-admin/firestore";
 import { getFirestoreDb, COMPANY_PROMISES_COLLECTION } from "@/lib/firebase/admin";
 import { scorePromise } from "@/lib/company/scoring";
 import { PromiseForVerification, VerificationResult } from "@/lib/company/verify";
+import { calculateCompanyScore } from "@/lib/company/score";
 
 interface ScoreDocRequest {
   promiseDocId?: string;
@@ -194,8 +195,6 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // 4) Score varje promise
     console.log("[score] Starting to score promises...");
     const scoredPromises: StoredPromise[] = [];
-    let scoredCount = 0;
-    let scoreSum = 0;
     
     // Skapa en timestamp som används för alla promises i denna batch
     const scoringTimestamp = new Date().toISOString();
@@ -219,11 +218,6 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           };
 
           scoredPromises.push(scoredPromise);
-
-          if (scoreResult.status !== "UNCLEAR") {
-            scoredCount += 1;
-            scoreSum += scoreResult.score0to100;
-          }
         } catch (promiseError) {
           console.error(`[score] Error scoring promise ${idx}:`, promiseError);
           // Fortsätt med default score för denna promise
@@ -257,10 +251,14 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    const companyScore = scoredCount > 0 ? Number((scoreSum / scoredCount).toFixed(2)) : null;
-    console.log(`[score] Scoring complete: companyScore=${companyScore}, scoredCount=${scoredCount}, totalPromises=${promises.length}`);
+    // 5) Beräkna company score baserat på verifierade promises
+    const companyScoreResult = calculateCompanyScore(scoredPromises);
+    const companyScore = companyScoreResult.companyScore;
+    const scoredCount = companyScoreResult.scoredCount;
+    
+    console.log(`[score] Scoring complete: companyScore=${companyScore}, scoredCount=${scoredCount}, breakdown:`, companyScoreResult.breakdown);
 
-    // 5) Skriv tillbaka
+    // 6) Skriv tillbaka
     try {
       console.log("[score] Updating Firestore document...");
       await docRef.update({
@@ -291,6 +289,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         companyScore,
         scoredCount,
         totalPromises: promises.length,
+        breakdown: companyScoreResult.breakdown,
         promises: scoredPromises.map((p) => ({
           text: p.text,
           type: p.type,

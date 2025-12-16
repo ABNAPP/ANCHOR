@@ -9,6 +9,7 @@
  * - Tydligare feedback när KPI saknas
  * - Beräkning av Operating Margin för MARGIN promises
  * - Stöd för FCF och EPS verification
+ * - Automatisk KPI-baserad verifiering för UNCLEAR promises
  */
 
 import { ExtractedKpi, KpiExtractionResult, getKpiHistory } from "./kpis";
@@ -63,6 +64,29 @@ export interface PromiseForVerification {
   confidence: string;
 }
 
+/**
+ * Extended promise interface för automatisk verifiering.
+ * Inkluderar score med möjlighet att uppdatera status.
+ */
+export interface PromiseWithScore extends PromiseForVerification {
+  score?: {
+    score0to100: number;
+    status: "HELD" | "MIXED" | "FAILED" | "UNCLEAR";
+    reasons: string[];
+    scoredAt?: string;
+    verifiedBy?: "kpi" | "manual";
+    comparedKpi?: {
+      key: string;
+      label: string;
+    };
+    delta?: {
+      abs: number;
+      pct: number;
+    };
+    verifiedAt?: string;
+  };
+}
+
 // ============================================
 // KPI MAPPING FOR PROMISE TYPES (IMPROVED)
 // ============================================
@@ -84,7 +108,7 @@ interface KpiMappingConfig {
 
 const PROMISE_TYPE_TO_KPI: Record<string, KpiMappingConfig> = {
   REVENUE: {
-    primary: ["revenue"],
+    primary: ["revenue", "netSales"],
   },
   DEBT: {
     primary: ["totalDebt"],
@@ -97,12 +121,11 @@ const PROMISE_TYPE_TO_KPI: Record<string, KpiMappingConfig> = {
     primary: ["fcf"], // Free Cash Flow (beräknas i kpis.ts från CFO - CapEx)
   },
   COSTS: {
-    // För COSTS: använd operatingIncome som proxy
-    // Om operatingIncome ökar = relativa costs minskar = SUPPORTED
-    primary: ["operatingIncome"],
-    // Fallback: om operatingIncome saknas, kan vi använda netIncome som proxy
-    // (men det är mindre optimalt eftersom det inkluderar icke-operativa poster)
-    fallbacks: ["netIncome"],
+    // För COSTS: använd operatingExpenses eller COGS
+    primary: ["operatingExpenses", "cogs"],
+    // Fallback: om operatingExpenses saknas, kan vi använda operatingIncome som proxy
+    // (om operatingIncome ökar = relativa costs minskar = SUPPORTED)
+    fallbacks: ["operatingIncome"],
   },
   MARGIN: {
     // För MARGIN: försök beräkna Operating Margin först (Revenue + OperatingIncome)
@@ -123,10 +146,10 @@ const PROMISE_TYPE_TO_KPI: Record<string, KpiMappingConfig> = {
     primary: [], // Ingen direkt KPI-mapping
   },
   PRODUCT: {
-    primary: ["revenue"], // Produkt-promises kan verifieras mot revenue
+    primary: ["revenue", "netSales"], // Produkt-promises kan verifieras mot revenue
   },
   MARKET: {
-    primary: ["revenue"], // Market-promises kan verifieras mot revenue
+    primary: ["revenue", "netSales"], // Market-promises kan verifieras mot revenue
   },
   OTHER: {
     primary: [], // Ingen direkt KPI-mapping
@@ -140,9 +163,12 @@ const PROMISE_TYPE_TO_KPI: Record<string, KpiMappingConfig> = {
  */
 const KPI_DIRECTION_POSITIVE: Record<string, boolean> = {
   revenue: true,
+  netSales: true,
   grossProfit: true,
   operatingIncome: true,
   netIncome: true,
+  operatingExpenses: false, // Minskade expenses är positivt
+  cogs: false, // Minskade COGS är positivt
   capex: true,
   totalDebt: false, // Minskad skuld är positivt
   longTermDebt: false,
@@ -360,6 +386,199 @@ function findFirstAvailableKpi(
   }
   
   return null;
+}
+
+// ============================================
+// AUTOMATIC KPI-BASED VERIFICATION FOR UNCLEAR PROMISES
+// ============================================
+
+/**
+ * Automatisk KPI-baserad verifiering för promises med status "UNCLEAR".
+ * 
+ * För varje promise med score.status = "UNCLEAR":
+ * 1) Identifiera KPI-typ baserat på promise.type
+ * 2) Jämför senaste FY mot föregående FY
+ * 3) Sätt verification baserat på POSITIVE/NEGATIVE
+ * 4) Uppdatera promise.score med ny status, verifiedBy, comparedKpi, delta, verifiedAt
+ * 
+ * @param promises - Array av promises med score (endast UNCLEAR kommer att verifieras)
+ * @param kpiResult - KPI-data från XBRL
+ * @returns Uppdaterade promises med nya score-statusar
+ */
+export function autoVerifyUnclearPromises(
+  promises: PromiseWithScore[],
+  kpiResult: KpiExtractionResult
+): PromiseWithScore[] {
+  const updatedPromises: PromiseWithScore[] = [];
+
+  for (const promise of promises) {
+    // Hoppa över om promise inte har score eller om status inte är UNCLEAR
+    if (!promise.score || promise.score.status !== "UNCLEAR") {
+      updatedPromises.push(promise);
+      continue;
+    }
+
+    try {
+      // Steg 1: Identifiera KPI-typ baserat på promise.type
+      const mapping = PROMISE_TYPE_TO_KPI[promise.type];
+      
+      if (!mapping || mapping.primary.length === 0) {
+        // Ingen KPI-mapping för denna typ - behåll UNCLEAR
+        updatedPromises.push(promise);
+        continue;
+      }
+
+      // Steg 2: Försök hitta KPI-data
+      let bestKpiKey: string | null = null;
+      let bestLabel: string = "";
+      let bestDataPoints: { before: ExtractedKpi | null; after: ExtractedKpi | null } | null = null;
+      let isCalculatedMargin = false;
+
+      // Steg 2a: Försök med beräknad margin för MARGIN promises
+      if (promise.type === "MARGIN" && mapping.calculated) {
+        const marginData = calculateMarginDataPoints(
+          kpiResult,
+          mapping.calculated.revenueKey,
+          mapping.calculated.incomeKey,
+          true
+        );
+        
+        if (marginData.after && marginData.before) {
+          bestKpiKey = "operatingMargin";
+          bestLabel = mapping.calculated.label;
+          bestDataPoints = {
+            after: {
+              key: "operatingMargin",
+              label: bestLabel,
+              period: marginData.after.period,
+              periodType: "annual",
+              value: marginData.after.value,
+              unit: marginData.after.unit,
+              filedDate: marginData.after.filedDate,
+              fiscalYear: 0,
+              fiscalPeriod: "FY",
+              form: "10-K",
+            },
+            before: {
+              key: "operatingMargin",
+              label: bestLabel,
+              period: marginData.before.period,
+              periodType: "annual",
+              value: marginData.before.value,
+              unit: marginData.before.unit,
+              filedDate: marginData.before.filedDate,
+              fiscalYear: 0,
+              fiscalPeriod: "FY",
+              form: "10-K",
+            },
+          };
+          isCalculatedMargin = true;
+        }
+      }
+
+      // Steg 2b: Om ingen beräknad margin hittades, prova direkta KPIs
+      if (!bestDataPoints || !bestDataPoints.after || !bestDataPoints.before) {
+        const kpiKeys = findKpiKeysForPromiseType(promise.type);
+        const found = findFirstAvailableKpi(kpiResult, kpiKeys, true);
+        
+        if (found && found.dataPoints.after && found.dataPoints.before) {
+          bestKpiKey = found.key;
+          bestLabel = found.label;
+          bestDataPoints = found.dataPoints;
+        }
+      }
+
+      // Steg 3: Om ingen data hittades med både before och after, behåll UNCLEAR
+      if (!bestKpiKey || !bestDataPoints || !bestDataPoints.after || !bestDataPoints.before) {
+        updatedPromises.push(promise);
+        continue;
+      }
+
+      // Steg 4: Jämför senaste FY mot föregående FY
+      const { deltaAbs, deltaPct } = calculateDelta(
+        bestDataPoints.before.value,
+        bestDataPoints.after.value
+      );
+
+      // Steg 5: Avgör om förändringen är POSITIVE eller NEGATIVE
+      const isIncreasePositive = KPI_DIRECTION_POSITIVE[bestKpiKey] ?? true;
+      const valueIncreased = deltaAbs > 0;
+      const isPositiveChange = isIncreasePositive ? valueIncreased : !valueIncreased;
+
+      // Steg 6: Detektera om promise är positiv (increase/grow) eller negativ (decrease/reduce)
+      const promiseTextLower = promise.text.toLowerCase();
+      const isPositiveClaim = 
+        ["increase", "increases", "increasing", "grow", "grows", "growing", "raise", "raises", "rising", "improve", "improves", "improving", "expand", "expanding", "higher", "up", "double", "triple"].some(
+          keyword => promiseTextLower.includes(keyword)
+        );
+      const isNegativeClaim = 
+        ["decrease", "decreases", "decreasing", "reduce", "reduces", "reducing", "cut", "cuts", "cutting", "lower", "lowering", "down", "decline", "declines", "declining"].some(
+          keyword => promiseTextLower.includes(keyword)
+        );
+
+      // Steg 7: Sätt verification status
+      let newStatus: "HELD" | "MIXED" | "FAILED" | "UNCLEAR" = "UNCLEAR";
+
+      if (isPositiveClaim) {
+        // Positiv claim (t.ex. "increase revenue")
+        if (isPositiveChange && Math.abs(deltaPct) >= 1) {
+          newStatus = "HELD";
+        } else if (!isPositiveChange && Math.abs(deltaPct) >= 1) {
+          newStatus = "FAILED";
+        } else {
+          newStatus = "MIXED";
+        }
+      } else if (isNegativeClaim) {
+        // Negativ claim (t.ex. "reduce costs")
+        if (!isPositiveChange && Math.abs(deltaPct) >= 1) {
+          // För costs: minskning är positivt
+          newStatus = "HELD";
+        } else if (isPositiveChange && Math.abs(deltaPct) >= 1) {
+          newStatus = "FAILED";
+        } else {
+          newStatus = "MIXED";
+        }
+      } else {
+        // Ingen tydlig riktning i claim - sätt MIXED om förändring är signifikant
+        if (Math.abs(deltaPct) >= 5) {
+          newStatus = "MIXED";
+        } else {
+          newStatus = "UNCLEAR";
+        }
+      }
+
+      // Steg 8: Uppdatera promise.score
+      const updatedPromise: PromiseWithScore = {
+        ...promise,
+        score: {
+          ...promise.score,
+          status: newStatus,
+          verifiedBy: "kpi",
+          comparedKpi: {
+            key: bestKpiKey,
+            label: bestLabel,
+          },
+          delta: {
+            abs: deltaAbs,
+            pct: deltaPct,
+          },
+          verifiedAt: new Date().toISOString(),
+          reasons: [
+            ...promise.score.reasons,
+            `Auto-verifierad via KPI: ${bestLabel} ${valueIncreased ? 'ökade' : 'minskade'} med ${Math.abs(deltaPct).toFixed(2)}% (${bestDataPoints.before.period} → ${bestDataPoints.after.period})`,
+          ],
+        },
+      };
+
+      updatedPromises.push(updatedPromise);
+    } catch (error) {
+      // Om något går fel, behåll original promise
+      console.error(`[autoVerify] Error verifying promise:`, error);
+      updatedPromises.push(promise);
+    }
+  }
+
+  return updatedPromises;
 }
 
 // ============================================
