@@ -14,6 +14,7 @@
 import { VerificationResult, VerificationStatus, verifyPromiseWithKpis, PromiseForVerification } from "./verify";
 import { KpiExtractionResult } from "./kpis";
 import { PromiseType } from "./promises";
+import { getKpiRefsForPromise } from "./promise-kpi-mapping";
 
 // ============================================
 // TYPES
@@ -225,13 +226,42 @@ export function bulkVerifyPromises(
         return;
       }
       
-      // Infer promise type om saknas eller är "OTHER"/"unknown"
+      // Använd centraliserad mapping för att hitta relevanta KPI:er
+      const mappedKpiRefs = getKpiRefsForPromise({
+        type: promise.type,
+        text: promise.text || "",
+      });
+      
+      // Om ingen KPI-matchning → sätt direkt till Unclear (skip verifiering)
+      if (mappedKpiRefs.length === 0) {
+        const bulkVerification: PromiseVerificationData = {
+          status: "Unclear",
+          reason: "Ingen KPI-mapping hittades för denna promise-typ",
+          kpiRefs: [],
+          computedAt: new Date().toISOString(),
+          computedBy: "bulk-kpi",
+        };
+        
+        summary.updated++;
+        summary.unclear++;
+        results.push({
+          promiseIndex: originalIndex,
+          verification: bulkVerification,
+        });
+        return;
+      }
+      
+      // Infer promise type om saknas eller är "OTHER" (för verifyPromiseWithKpis)
       let promiseType: PromiseType = promise.type || "OTHER";
       if (promiseType === "OTHER" || !promiseType) {
-        const inferredType = inferPromiseTypeFromText(promise.text || "");
-        if (inferredType !== "unknown") {
-          promiseType = inferredType as PromiseType;
-        }
+        // Om mapping hittade KPI:er, försök inferera type från text
+        // (enklare logik här eftersom mapping redan gjorts)
+        const lowerText = (promise.text || "").toLowerCase();
+        if (lowerText.match(/\b(revenue|sales)\b/)) promiseType = "REVENUE";
+        else if (lowerText.match(/\b(margin|profit)\b/)) promiseType = "MARGIN";
+        else if (lowerText.match(/\b(capex|invest)\b/)) promiseType = "CAPEX";
+        else if (lowerText.match(/\b(cost|expense)\b/)) promiseType = "COSTS";
+        else if (lowerText.match(/\b(debt)\b/)) promiseType = "DEBT";
       }
       
       // Förbered promise för verifiering
@@ -257,7 +287,10 @@ export function bulkVerifyPromises(
       
       // Mappa till bulk-format
       const bulkStatus = mapStatusToBulk(verificationResult.status);
-      const kpiRefs: string[] = verificationResult.kpiUsed ? [verificationResult.kpiUsed.key] : [];
+      // Använd faktiska KPI:er från verifieringen, fallback till mappade KPI:er
+      const finalKpiRefs: string[] = verificationResult.kpiUsed 
+        ? [verificationResult.kpiUsed.key] 
+        : mappedKpiRefs;
       
       // Bygg reason-sträng från notes och reasoning
       let reason = verificationResult.notes || "";
@@ -271,7 +304,7 @@ export function bulkVerifyPromises(
       const bulkVerification: PromiseVerificationData = {
         status: bulkStatus,
         reason,
-        kpiRefs,
+        kpiRefs: finalKpiRefs,
         computedAt: new Date().toISOString(),
         computedBy: "bulk-kpi",
       };
