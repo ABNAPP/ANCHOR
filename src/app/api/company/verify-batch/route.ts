@@ -17,6 +17,7 @@ import {
   COMPANY_PROMISES_COLLECTION
 } from "@/lib/firebase/admin";
 import { PromiseVerification } from "@/lib/firebase/types";
+import { sanitizePromisesForFirestore, sanitizeForFirestore } from "@/lib/firebase/sanitize";
 
 // ============================================
 // TYPES
@@ -467,11 +468,15 @@ export async function POST(request: NextRequest): Promise<NextResponse<BatchVeri
           return p;
         });
         
-        await docRef.update({
-          promises: updatedPromises,
+        // Sanitera promises innan Firestore update
+        const sanitizedPromises = sanitizePromisesForFirestore(updatedPromises);
+        const updateData = sanitizeForFirestore({
+          promises: sanitizedPromises,
           verificationUpdatedAt: FieldValue.serverTimestamp(),
         });
         
+        await docRef.update(updateData);
+        console.log("[firestore] sanitized write payload ok");
         console.log(`[verify] Firestore document updated with ${results.length} verifications`);
       } else {
         console.warn(`[verify] Firestore document ${promiseDocId} not found - skipping update`);

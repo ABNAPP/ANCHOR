@@ -22,6 +22,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { getFirestoreDb, COMPANY_PROMISES_COLLECTION } from "@/lib/firebase/admin";
+import { sanitizePromisesForFirestore, sanitizeForFirestore } from "@/lib/firebase/sanitize";
 import { scorePromise } from "@/lib/company/scoring";
 import { PromiseForVerification, VerificationResult, verifyPromisesWithNormalizedKpis, PromiseWithScore } from "@/lib/company/verify";
 import { calculateCompanyScore } from "@/lib/company/score";
@@ -338,11 +339,17 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // 7) Skriv tillbaka
     try {
       console.log("[score] Updating Firestore document...");
-      await docRef.update({
-        promises: scoredPromises,
+      
+      // Sanitera promises för att ta bort undefined-värden
+      const sanitizedPromises = sanitizePromisesForFirestore(scoredPromises);
+      const updateData = sanitizeForFirestore({
+        promises: sanitizedPromises,
         companyScore,
         scoringUpdatedAt: FieldValue.serverTimestamp(), // Top-level FieldValue är OK (inte i array)
       });
+      
+      await docRef.update(updateData);
+      console.log("[firestore] sanitized write payload ok");
       console.log("[score] Firestore update successful");
     } catch (updateError) {
       console.error("[score] Firestore update failed:", updateError);

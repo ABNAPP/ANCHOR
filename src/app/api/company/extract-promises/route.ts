@@ -15,7 +15,8 @@ import { FieldValue } from "firebase-admin/firestore";
 import { fetchFilingDocument } from "@/lib/sec/client";
 import { parseFiling, selectBestTextForAnalysis } from "@/lib/sec/parse";
 import { extractPromises, PromiseExtractionResult } from "@/lib/company/promises";
-import { getFirestoreDb, isFirebaseConfigured } from "@/lib/firebase/admin";
+import { getFirestoreDb, isFirebaseConfigured, COMPANY_PROMISES_COLLECTION } from "@/lib/firebase/admin";
+import { sanitizeForFirestore } from "@/lib/firebase/sanitize";
 
 // ============================================
 // TYPES
@@ -52,7 +53,6 @@ export interface ExtractPromisesError {
   suggestion?: string;
 }
 
-const COMPANY_PROMISES_COLLECTION = "company_promises";
 
 // Endast dessa form types stöds
 const SUPPORTED_FORM_TYPES = ["10-K", "10-Q"];
@@ -248,10 +248,15 @@ export async function POST(
                 confidence: p.confidence,
                 confidenceScore: p.confidenceScore,
                 keywords: p.keywords,
+                verification: null, // Explicit null istället för undefined
+                score: null, // Explicit null istället för undefined
               })),
           };
 
-          const docRef = await db.collection(COMPANY_PROMISES_COLLECTION).add(docData);
+          // Sanitera innan Firestore write
+          const sanitizedDocData = sanitizeForFirestore(docData);
+          const docRef = await db.collection(COMPANY_PROMISES_COLLECTION).add(sanitizedDocData);
+          console.log("[firestore] sanitized write payload ok");
           firestoreId = docRef.id;
           savedToFirestore = true;
           console.log(`[Extract Promises] Saved to Firestore: ${firestoreId}`);
