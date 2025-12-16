@@ -52,6 +52,12 @@ interface ExtractedPromise {
   confidenceScore: number;
   keywords: string[];
   source: string;
+  score?: {
+    score0to100: number;
+    status: "HELD" | "MIXED" | "FAILED" | "UNCLEAR";
+    reasons: string[];
+    scoredAt?: string;
+  };
 }
 
 interface ExtractionResult {
@@ -179,6 +185,13 @@ const STATUS_CONFIG: Record<VerificationStatus, { label: string; emoji: string; 
   PENDING: { label: "Väntar", emoji: "⏳", color: "var(--text-muted)" },
 };
 
+const SCORE_STATUS_CONFIG: Record<"HELD" | "MIXED" | "FAILED" | "UNCLEAR", { label: string; emoji: string; color: string }> = {
+  HELD: { label: "Held", emoji: "✅", color: "var(--accent-green)" },
+  MIXED: { label: "Mixed", emoji: "⚠️", color: "var(--accent-orange)" },
+  FAILED: { label: "Failed", emoji: "❌", color: "var(--accent-red)" },
+  UNCLEAR: { label: "Unclear", emoji: "❓", color: "var(--text-muted)" },
+};
+
 // ============================================
 // HELPER FUNCTIONS
 // ============================================
@@ -262,6 +275,10 @@ export default function CompanyPage() {
   const [selectedVerification, setSelectedVerification] = useState<{ index: number; result: VerificationResult } | null>(null);
   const [selectedPromiseIndices, setSelectedPromiseIndices] = useState<Set<number>>(new Set());
   const [batchVerifying, setBatchVerifying] = useState(false);
+
+  // Scoring State
+  const [companyScore, setCompanyScore] = useState<number | null>(null);
+  const [scoringLoading, setScoringLoading] = useState(false);
 
   // ============================================
   // DERIVED STATE
@@ -743,6 +760,66 @@ export default function CompanyPage() {
     setSelectedPromiseIndices(new Set());
   }, []);
 
+  const handleScorePromises = useCallback(async () => {
+    if (!extractResponse?.firestoreId) {
+      addDebugError("score", new Error("Saknar firestoreId. Extrahera promises först och spara till Firestore."));
+      return;
+    }
+
+    setScoringLoading(true);
+
+    try {
+      const res = await fetch("/api/company/score-doc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          promiseDocId: extractResponse.firestoreId,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({ ok: false, error: { message: "Failed to parse JSON response" } }));
+
+      if (!res.ok || !data.ok) {
+        const errorMsg = data.error?.message || data.message || "Scoring misslyckades";
+        const errorDetails = data.error?.details ? JSON.stringify(data.error.details, null, 2) : undefined;
+        addDebugError("score", new Error(errorMsg), res.status, errorDetails);
+        return;
+      }
+
+      const result = data.data;
+      if (result) {
+        setCompanyScore(result.companyScore ?? null);
+        
+        // Uppdatera promises med scores från response
+        if (result.promises && Array.isArray(result.promises)) {
+          setExtractResponse((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              extraction: {
+                ...prev.extraction,
+                promises: prev.extraction.promises.map((p, idx) => {
+                  const scoredPromise = result.promises[idx];
+                  if (scoredPromise?.score) {
+                    return {
+                      ...p,
+                      score: scoredPromise.score,
+                    };
+                  }
+                  return p;
+                }),
+              },
+            };
+          });
+        }
+      }
+    } catch (err) {
+      addDebugError("score", err);
+    } finally {
+      setScoringLoading(false);
+    }
+  }, [extractResponse, addDebugError]);
+
   const handleReset = useCallback(() => {
     setStep("search");
     setSearchQuery("");
@@ -763,6 +840,7 @@ export default function CompanyPage() {
     setSelectedVerification(null);
     setSelectedPromiseIndices(new Set());
     setBatchVerifying(false);
+    setCompanyScore(null);
   }, []);
 
   // ============================================
@@ -1084,6 +1162,34 @@ export default function CompanyPage() {
                   </div>
 
                   <div style={styles.statsGrid}>
+                    {companyScore !== null && (
+                      <div style={{
+                        ...styles.statCard,
+                        gridColumn: "1 / -1",
+                        backgroundColor: companyScore >= 80 
+                          ? "rgba(34, 197, 94, 0.1)" 
+                          : companyScore >= 50 
+                          ? "rgba(251, 146, 60, 0.1)" 
+                          : "rgba(239, 68, 68, 0.1)",
+                        border: `2px solid ${companyScore >= 80 
+                          ? "var(--accent-green)" 
+                          : companyScore >= 50 
+                          ? "var(--accent-orange)" 
+                          : "var(--accent-red)"}`,
+                      }}>
+                        <div style={{
+                          ...styles.statValue,
+                          color: companyScore >= 80 
+                            ? "var(--accent-green)" 
+                            : companyScore >= 50 
+                            ? "var(--accent-orange)" 
+                            : "var(--accent-red)",
+                        }}>
+                          {companyScore.toFixed(0)}
+                        </div>
+                        <div style={styles.statLabel}>Company Score</div>
+                      </div>
+                    )}
                     <div style={styles.statCard}>
                       <div style={styles.statValue}>{extractResponse?.extraction?.totalSentences ?? 0}</div>
                       <div style={styles.statLabel}>Meningar</div>
@@ -1290,6 +1396,25 @@ export default function CompanyPage() {
                         {selectedPromiseIndices.size} valda
                       </span>
                     )}
+                    <div style={{ marginLeft: "auto" }}>
+                      <button
+                        onClick={handleScorePromises}
+                        disabled={scoringLoading || !extractResponse?.firestoreId}
+                        style={{
+                          padding: "0.5rem 1rem",
+                          backgroundColor: (scoringLoading || !extractResponse?.firestoreId) ? "var(--text-muted)" : "var(--accent-purple)",
+                          color: "white",
+                          border: "none",
+                          borderRadius: "0.375rem",
+                          cursor: (scoringLoading || !extractResponse?.firestoreId) ? "not-allowed" : "pointer",
+                          fontWeight: 600,
+                          fontSize: "0.875rem",
+                        }}
+                        title={!extractResponse?.firestoreId ? "Spara promises till Firestore först" : ""}
+                      >
+                        {scoringLoading ? "Scorear..." : "Scorea promises"}
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -1327,6 +1452,7 @@ export default function CompanyPage() {
                         <th style={styles.th}>Conf.</th>
                         <th style={{...styles.th, width: "40%"}}>Claim</th>
                         <th style={styles.th}>Verifiering</th>
+                        <th style={styles.th}>Score</th>
                         <th style={styles.th}>Åtgärd</th>
                       </tr>
                     </thead>
@@ -1407,6 +1533,54 @@ export default function CompanyPage() {
                                   {verification.status === "UNRESOLVED" && (
                                     <span style={{ fontSize: "0.7rem", marginLeft: "0.25rem", opacity: 0.7 }} title={verification.notes}>
                                       ℹ️
+                                    </span>
+                                  )}
+                                </div>
+                              ) : (
+                                <span style={styles.notVerified}>—</span>
+                              )}
+                            </td>
+                            <td style={styles.td}>
+                              {promise.score ? (
+                                <div style={{ display: "flex", flexDirection: "column", gap: "0.25rem", alignItems: "flex-start" }}>
+                                  <div style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: "0.375rem",
+                                    fontSize: "0.8rem",
+                                  }}>
+                                    <span style={{
+                                      fontWeight: 700,
+                                      fontFamily: "'JetBrains Mono', monospace",
+                                      color: promise.score.score0to100 >= 80 
+                                        ? "var(--accent-green)" 
+                                        : promise.score.score0to100 >= 50 
+                                        ? "var(--accent-orange)" 
+                                        : "var(--accent-red)",
+                                    }}>
+                                      {promise.score.score0to100.toFixed(0)}
+                                    </span>
+                                    <span style={{
+                                      ...styles.typeBadge,
+                                      backgroundColor: SCORE_STATUS_CONFIG[promise.score.status]?.color + "20",
+                                      color: SCORE_STATUS_CONFIG[promise.score.status]?.color,
+                                    }}>
+                                      {SCORE_STATUS_CONFIG[promise.score.status]?.emoji} {SCORE_STATUS_CONFIG[promise.score.status]?.label}
+                                    </span>
+                                  </div>
+                                  {promise.score.reasons && promise.score.reasons.length > 0 && (
+                                    <span 
+                                      style={{ 
+                                        fontSize: "0.65rem", 
+                                        color: "var(--text-muted)",
+                                        maxWidth: "200px",
+                                        overflow: "hidden",
+                                        textOverflow: "ellipsis",
+                                        whiteSpace: "nowrap",
+                                      }}
+                                      title={promise.score.reasons.join("; ")}
+                                    >
+                                      {promise.score.reasons[0]}
                                     </span>
                                   )}
                                 </div>
