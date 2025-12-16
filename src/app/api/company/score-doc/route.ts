@@ -16,7 +16,11 @@
  *    - kör scorePromise()
  * 3) Beräkna company score baserat på verifierade promises
  * 4) Uppdatera dokumentet med promise.score och companyScore
- * 5) Returnera { ok:true, data:{ companyScore, scoredCount, totalPromises, breakdown } }
+ * 5) Returnera { success:true, companyScore, scoredCount, breakdown, promises, debugMeta }
+ *
+ * Felhantering:
+ * - Alla fel returnerar { success:false, error:{ code, message, details } } med HTTP 400/500
+ * - scoredCount = 0 är INTE ett fel, returnera success:true med companyScore:null
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -29,6 +33,19 @@ import { calculateCompanyScore } from "@/lib/company/score";
 import { extractKpisFromCompanyFacts } from "@/lib/company/kpis";
 import { fetchCompanyFacts } from "@/lib/sec/client";
 
+// Helper för att normalisera promise (exporterad från verify.ts via normalizePromise)
+function normalizePromise(promise: Partial<PromiseWithScore> & { type?: string; confidence?: string | number }): PromiseWithScore {
+  return {
+    text: promise.text ?? "",
+    type: (promise.type ?? "OTHER") as any,
+    timeHorizon: promise.timeHorizon ?? "UNSPECIFIED",
+    measurable: promise.measurable ?? false,
+    confidence: typeof promise.confidence === "number" ? String(promise.confidence) : (promise.confidence ?? "low"),
+    verification: promise.verification ?? null,
+    score: promise.score ?? null,
+  };
+}
+
 interface ScoreDocRequest {
   promiseDocId?: string;
 }
@@ -40,18 +57,19 @@ interface StoredPromise {
   measurable?: boolean;
   confidence?: string | number;
   confidenceScore?: number;
-  verification?: VerificationResult;
-  score?: {
+  verification: VerificationResult | null; // Alltid satt (antingen objekt eller null, aldrig undefined)
+  score: {
     score0to100: number;
     status: string;
     reasons: string[];
     scoredAt: string; // ISO timestamp string (inte FieldValue - Firestore tillåter inte FieldValue i arrays)
-  };
+  } | null; // Alltid satt (antingen objekt eller null, aldrig undefined)
 }
 
 interface FirestorePromiseDoc {
   promises?: StoredPromise[];
   companyScore?: number;
+  cik10?: string;
 }
 
 function buildDefaultVerification(): VerificationResult {
@@ -81,20 +99,20 @@ function mapPromiseForVerification(p: StoredPromise): PromiseForVerification {
 }
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
-  console.log("[score] POST /api/company/score-doc - Starting");
+  console.log("[score-doc] POST /api/company/score-doc - Starting");
 
   try {
     // 1) Parse body
     let body: ScoreDocRequest;
     try {
       const bodyText = await request.text();
-      console.log("[score] Request body:", bodyText);
+      console.log("[score-doc] Request body:", bodyText);
       body = JSON.parse(bodyText);
     } catch (err) {
-      console.error("[score] Failed to parse request body:", err);
+      console.error("[score-doc] error", err);
       return NextResponse.json(
         {
-          ok: false,
+          success: false,
           error: {
             code: "INVALID_JSON",
             message: "Ogiltig JSON i request body",
@@ -106,13 +124,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     const { promiseDocId } = body;
-    console.log("[score] promiseDocId:", promiseDocId);
+    console.log("[score-doc] promiseDocId:", promiseDocId);
 
     if (!promiseDocId || typeof promiseDocId !== "string") {
-      console.error("[score] Missing or invalid promiseDocId");
+      console.error("[score-doc] error: Missing or invalid promiseDocId");
       return NextResponse.json(
         {
-          ok: false,
+          success: false,
           error: {
             code: "MISSING_PROMISE_DOC_ID",
             message: "promiseDocId är obligatoriskt och måste vara en sträng",
@@ -124,34 +142,34 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     // 2) Firestore init
-    console.log("[score] Initializing Firestore...");
+    console.log("[score-doc] Initializing Firestore...");
     const db = getFirestoreDb();
     if (!db) {
-      console.error("[score] Firestore not configured");
+      console.error("[score-doc] error: Firestore not configured");
       return NextResponse.json(
         {
-          ok: false,
+          success: false,
           error: {
             code: "FIRESTORE_NOT_CONFIGURED",
             message: "Firestore är inte konfigurerat",
             details: "Kontrollera att Firebase-miljövariabler är satta i .env.local",
           },
         },
-        { status: 503 }
+        { status: 500 }
       );
     }
 
     // 3) Hämta dokument
-    console.log(`[score] Fetching document ${promiseDocId} from collection ${COMPANY_PROMISES_COLLECTION}`);
+    console.log(`[score-doc] Fetching document ${promiseDocId} from collection ${COMPANY_PROMISES_COLLECTION}`);
     const docRef = db.collection(COMPANY_PROMISES_COLLECTION).doc(promiseDocId);
     let snap;
     try {
       snap = await docRef.get();
     } catch (firestoreError) {
-      console.error("[score] Firestore get() failed:", firestoreError);
+      console.error("[score-doc] error", firestoreError);
       return NextResponse.json(
         {
-          ok: false,
+          success: false,
           error: {
             code: "FIRESTORE_ERROR",
             message: "Kunde inte hämta dokument från Firestore",
@@ -163,10 +181,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     if (!snap.exists) {
-      console.error(`[score] Document ${promiseDocId} not found`);
+      console.error(`[score-doc] error: Document ${promiseDocId} not found`);
       return NextResponse.json(
         {
-          ok: false,
+          success: false,
           error: {
             code: "NOT_FOUND",
             message: `promiseDocId ${promiseDocId} hittades inte i Firestore`,
@@ -179,11 +197,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     const data = snap.data() as FirestorePromiseDoc;
     const promises = data.promises || [];
-    const cik10 = (data as any).cik10 || "";
-    console.log(`[score] Found document with ${promises.length} promises, cik10: ${cik10}`);
+    const cik10 = data.cik10 || "";
+    console.log(`[score-doc] Found document with ${promises.length} promises, cik10: ${cik10}`);
 
     if (promises.length === 0) {
-      console.warn("[score] Document has no promises");
+      console.log("[score-doc] Document has no promises - returning success with empty data");
       return NextResponse.json(
         {
           success: true,
@@ -203,21 +221,21 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // 3) Hämta KPI-data om cik10 finns
+    // 4) Hämta KPI-data om cik10 finns
     let kpiResult = null;
     if (cik10) {
       try {
-        console.log(`[score] Fetching KPI data for CIK ${cik10}...`);
+        console.log(`[score-doc] Fetching KPI data for CIK ${cik10}...`);
         const companyFacts = await fetchCompanyFacts(cik10);
         kpiResult = extractKpisFromCompanyFacts(companyFacts);
-        console.log(`[score] KPI data fetched: ${kpiResult.kpis.length} data points`);
+        console.log(`[score-doc] KPI data fetched: ${kpiResult.kpis.length} data points`);
       } catch (kpiError) {
-        console.error(`[score] Failed to fetch KPI data:`, kpiError);
-        // Fortsätt utan KPI-data
+        console.error(`[score-doc] Failed to fetch KPI data (continuing without it):`, kpiError);
+        // Fortsätt utan KPI-data - detta är INTE ett kritiskt fel
       }
     }
 
-    // 4) Verifiera promises med normaliserad KPI-map om KPI-data finns
+    // 5) Verifiera promises med normaliserad KPI-map om KPI-data finns
     let verificationResults: Map<number, VerificationResult> | null = null;
     let updatedPromises: PromiseWithScore[] = [];
     let debugMeta: any = {
@@ -230,18 +248,40 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     };
 
     if (kpiResult) {
-      console.log(`[score] Verifying promises with normalized KPIs...`);
-      const promisesForVerification: PromiseForVerification[] = promises.map(p => mapPromiseForVerification(p));
-      const verifyResult = verifyPromisesWithNormalizedKpis(promisesForVerification, kpiResult);
-      verificationResults = verifyResult.results;
-      updatedPromises = verifyResult.updatedPromises;
-      debugMeta = verifyResult.debugMeta;
-      console.log(`[score] Verification complete: HELD=${debugMeta.resultsCounts.held}, MIXED=${debugMeta.resultsCounts.mixed}, FAILED=${debugMeta.resultsCounts.failed}, UNCLEAR=${debugMeta.resultsCounts.unclear}`);
+      try {
+        console.log(`[score-doc] Verifying promises with normalized KPIs...`);
+        const promisesForVerification: PromiseForVerification[] = promises.map(p => mapPromiseForVerification(p));
+        const verifyResult = verifyPromisesWithNormalizedKpis(promisesForVerification, kpiResult);
+        verificationResults = verifyResult.results;
+        updatedPromises = verifyResult.updatedPromises;
+        debugMeta = verifyResult.debugMeta;
+        console.log(`[score-doc] Verification complete: HELD=${debugMeta.resultsCounts.held}, MIXED=${debugMeta.resultsCounts.mixed}, FAILED=${debugMeta.resultsCounts.failed}, UNCLEAR=${debugMeta.resultsCounts.unclear}`);
+      } catch (verifyError) {
+        console.error("[score-doc] error during verification:", verifyError);
+        // Fortsätt med default promises - detta är INTE ett kritiskt fel
+        updatedPromises = promises.map(p => normalizePromise({
+          ...mapPromiseForVerification(p),
+          verification: null,
+          score: {
+            score0to100: 0,
+            status: "UNCLEAR" as const,
+            reasons: ["Verifiering misslyckades"],
+            scoredAt: new Date().toISOString(),
+          },
+        }));
+        
+        promises.forEach(p => {
+          const type = p.type || "UNKNOWN";
+          debugMeta.promiseTypeCounts[type] = (debugMeta.promiseTypeCounts[type] || 0) + 1;
+        });
+        debugMeta.resultsCounts.unclear = promises.length;
+      }
     } else {
-      console.log(`[score] No KPI data available, skipping verification`);
+      console.log(`[score-doc] No KPI data available, skipping verification`);
       // Skapa default promises med UNCLEAR status
-      updatedPromises = promises.map(p => ({
+      updatedPromises = promises.map(p => normalizePromise({
         ...mapPromiseForVerification(p),
+        verification: null,
         score: {
           score0to100: 0,
           status: "UNCLEAR" as const,
@@ -258,8 +298,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       debugMeta.resultsCounts.unclear = promises.length;
     }
 
-    // 5) Score varje promise (använd verifierade promises om de finns)
-    console.log("[score] Starting to score promises...");
+    // 6) Score varje promise (använd verifierade promises om de finns)
+    console.log("[score-doc] Starting to score promises...");
     const scoredPromises: StoredPromise[] = [];
     const scoringTimestamp = new Date().toISOString();
 
@@ -276,9 +316,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
               ...originalPromise,
               score: {
                 ...updatedPromise.score,
-                scoredAt: scoringTimestamp,
+                scoredAt: updatedPromise.score.scoredAt || scoringTimestamp,
               },
-              verification: verificationResults?.get(idx) || originalPromise.verification,
+              verification: verificationResults?.get(idx) || originalPromise.verification || null,
             });
           } else {
             // Annars kör scoring
@@ -291,17 +331,20 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
                 reasons: scoreResult.reasons,
                 scoredAt: scoringTimestamp,
               },
-              verification,
+              verification: verification || null,
             });
           }
         } catch (promiseError) {
-          console.error(`[score] Error scoring promise ${idx}:`, promiseError);
+          console.error(`[score-doc] Error scoring promise ${idx}:`, promiseError);
           const defaultVerification = buildDefaultVerification();
           const promiseForVerification = mapPromiseForVerification(promises[idx]);
           const scoreResult = scorePromise(promiseForVerification, defaultVerification);
           
-          scoredPromises.push({
+          const normalized = normalizePromise({
             ...promises[idx],
+            type: promises[idx].type as any,
+            confidence: typeof promises[idx].confidence === "number" ? String(promises[idx].confidence) : promises[idx].confidence,
+            verification: defaultVerification,
             score: {
               score0to100: scoreResult.score0to100,
               status: scoreResult.status,
@@ -309,13 +352,24 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
               scoredAt: scoringTimestamp,
             },
           });
+          // Konvertera till StoredPromise format
+          scoredPromises.push({
+            ...normalized,
+            verification: normalized.verification,
+            score: normalized.score ? {
+              score0to100: normalized.score.score0to100,
+              status: normalized.score.status,
+              reasons: normalized.score.reasons,
+              scoredAt: normalized.score.scoredAt || scoringTimestamp,
+            } : null,
+          });
         }
       });
     } catch (scoringError) {
-      console.error("[score] Error during scoring loop:", scoringError);
+      console.error("[score-doc] error", scoringError);
       return NextResponse.json(
         {
-          ok: false,
+          success: false,
           error: {
             code: "SCORING_FAILED",
             message: "Kunde inte scorea promises",
@@ -326,19 +380,27 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // 6) Beräkna company score baserat på verifierade promises
-    const companyScoreResult = calculateCompanyScore(scoredPromises);
+    // 7) Beräkna company score baserat på verifierade promises
+    // Konvertera StoredPromise[] till format som calculateCompanyScore förväntar sig
+    const promisesForScoring = scoredPromises.map(p => ({
+      score: p.score ? {
+        status: p.score.status,
+      } : undefined,
+    }));
+    const companyScoreResult = calculateCompanyScore(promisesForScoring);
     const companyScore = companyScoreResult.companyScore;
     const scoredCount = companyScoreResult.scoredCount;
     
-    console.log(`[score] Company score calculation:`);
-    console.log(`[score]   companyScore: ${companyScore}`);
-    console.log(`[score]   scoredCount: ${scoredCount}`);
-    console.log(`[score]   breakdown:`, companyScoreResult.breakdown);
+    console.log(`[score-doc] Company score calculation:`);
+    console.log(`[score-doc]   companyScore: ${companyScore}`);
+    console.log(`[score-doc]   scoredCount: ${scoredCount}`);
+    console.log(`[score-doc]   breakdown:`, companyScoreResult.breakdown);
 
-    // 7) Skriv tillbaka
+    // OBS: scoredCount = 0 är INTE ett fel - returnera success:true med companyScore:null
+
+    // 8) Skriv tillbaka
     try {
-      console.log("[score] Updating Firestore document...");
+      console.log("[score-doc] Updating Firestore document...");
       
       // Sanitera promises för att ta bort undefined-värden
       const sanitizedPromises = sanitizePromisesForFirestore(scoredPromises);
@@ -350,9 +412,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       
       await docRef.update(updateData);
       console.log("[firestore] sanitized write payload ok");
-      console.log("[score] Firestore update successful");
+      console.log("[score-doc] Firestore update successful");
     } catch (updateError) {
-      console.error("[score] Firestore update failed:", updateError);
+      console.error("[score-doc] error", updateError);
       return NextResponse.json(
         {
           success: false,
@@ -366,7 +428,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // 8) Returnera resultat med debugMeta
+    // 9) Returnera resultat med debugMeta
     const responseData = {
       success: true,
       companyScore,
@@ -384,7 +446,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           status: p.score.status,
           reasons: p.score.reasons,
           scoredAt: p.score.scoredAt, // Redan ISO string
-        } : undefined,
+        } : null,
         verification: p.verification,
       })),
       debugMeta: {
@@ -395,12 +457,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       },
     };
 
-    console.log("[score] Returning success response");
+    console.log("[score-doc] Returning success response");
     return NextResponse.json(responseData);
 
   } catch (error) {
     // Catch-all för oväntade fel
-    console.error("[score] Unexpected error:", error);
+    console.error("[score-doc] error", error);
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorStack = error instanceof Error ? error.stack : undefined;
 

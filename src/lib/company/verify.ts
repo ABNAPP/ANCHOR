@@ -13,6 +13,7 @@
  * - Fuzzy matching för KPI-keys
  * - Inferera promise type från text
  * - Förbättrad logging
+ * - Normalisering: verification och score är alltid null (inte undefined)
  */
 
 import { ExtractedKpi, KpiExtractionResult, getKpiHistory, NormalizedKpiMap, createNormalizedKpiMap } from "./kpis";
@@ -69,10 +70,12 @@ export interface PromiseForVerification {
 
 /**
  * Extended promise interface för automatisk verifiering.
- * Inkluderar score med möjlighet att uppdatera status.
+ * Inkluderar score och verification med möjlighet att uppdatera status.
+ * VIKTIGT: verification och score är alltid satta (antingen objekt eller null, aldrig undefined).
  */
 export interface PromiseWithScore extends PromiseForVerification {
-  score?: {
+  verification: VerificationResult | null;
+  score: {
     score0to100: number;
     status: "HELD" | "MIXED" | "FAILED" | "UNCLEAR";
     reasons: string[];
@@ -87,7 +90,7 @@ export interface PromiseWithScore extends PromiseForVerification {
       pct: number;
     };
     verifiedAt?: string;
-  };
+  } | null;
 }
 
 // ============================================
@@ -191,6 +194,22 @@ const KPI_DIRECTION_POSITIVE: Record<string, boolean> = {
 // ============================================
 // HELPER FUNCTIONS
 // ============================================
+
+/**
+ * Normaliserar en promise så att verification och score alltid är null (inte undefined).
+ * Detta säkerställer att Firestore inte får undefined-värden.
+ */
+function normalizePromise(promise: Partial<PromiseWithScore>): PromiseWithScore {
+  return {
+    text: promise.text ?? "",
+    type: (promise.type ?? "OTHER") as PromiseType,
+    timeHorizon: promise.timeHorizon ?? "UNSPECIFIED",
+    measurable: promise.measurable ?? false,
+    confidence: promise.confidence ?? "low",
+    verification: promise.verification ?? null,
+    score: promise.score ?? null,
+  };
+}
 
 /**
  * Infererar promise type från text med keywords (FÖRBÄTTRAD).
@@ -567,19 +586,22 @@ export function autoVerifyUnclearPromises(
   const updatedPromises: PromiseWithScore[] = [];
 
   for (const promise of promises) {
-    if (!promise.score || promise.score.status !== "UNCLEAR") {
-      updatedPromises.push(promise);
+    // Normalisera promise först
+    const normalized = normalizePromise(promise);
+    
+    if (!normalized.score || normalized.score.status !== "UNCLEAR") {
+      updatedPromises.push(normalized);
       continue;
     }
 
     try {
       // Normalisera promise type
-      const normalizedType = normalizePromiseType(promise.type);
+      const normalizedType = normalizePromiseType(normalized.type);
       
       // Försök inferera type om OTHER eller om type inte matchar någon KPI
       let promiseType = normalizedType;
       if (normalizedType === "OTHER" || !PROMISE_TYPE_TO_KPI[normalizedType] || PROMISE_TYPE_TO_KPI[normalizedType].primary.length === 0) {
-        const inferred = inferPromiseTypeFromText(promise.text);
+        const inferred = inferPromiseTypeFromText(normalized.text);
         if (inferred) {
           promiseType = inferred;
         }
@@ -588,7 +610,7 @@ export function autoVerifyUnclearPromises(
       const mapping = PROMISE_TYPE_TO_KPI[promiseType];
       
       if (!mapping || mapping.primary.length === 0) {
-        updatedPromises.push(promise);
+        updatedPromises.push(normalized);
         continue;
       }
 
@@ -676,7 +698,7 @@ export function autoVerifyUnclearPromises(
       }
 
       if (!bestKpiKey || !bestDataPoints || !bestDataPoints.after || !bestDataPoints.before) {
-        updatedPromises.push(promise);
+        updatedPromises.push(normalized);
         continue;
       }
 
@@ -689,7 +711,7 @@ export function autoVerifyUnclearPromises(
       const valueIncreased = deltaAbs > 0;
       const isPositiveChange = isIncreasePositive ? valueIncreased : !valueIncreased;
 
-      const promiseTextLower = promise.text.toLowerCase();
+      const promiseTextLower = normalized.text.toLowerCase();
       const isPositiveClaim = 
         ["increase", "increases", "increasing", "grow", "grows", "growing", "raise", "raises", "rising", "improve", "improves", "improving", "expand", "expanding", "higher", "up", "double", "triple"].some(
           keyword => promiseTextLower.includes(keyword)
@@ -725,10 +747,10 @@ export function autoVerifyUnclearPromises(
         }
       }
 
-      const updatedPromise: PromiseWithScore = {
-        ...promise,
+      const updatedPromise: PromiseWithScore = normalizePromise({
+        ...normalized,
         score: {
-          ...promise.score,
+          ...normalized.score!,
           status: newStatus,
           verifiedBy: "kpi",
           comparedKpi: {
@@ -741,16 +763,39 @@ export function autoVerifyUnclearPromises(
           },
           verifiedAt: new Date().toISOString(),
           reasons: [
-            ...promise.score.reasons,
+            ...normalized.score.reasons,
             `Auto-verifierad via KPI: ${bestLabel} ${valueIncreased ? 'ökade' : 'minskade'} med ${Math.abs(deltaPct).toFixed(2)}% (${bestDataPoints.before.period} → ${bestDataPoints.after.period})`,
           ],
         },
-      };
+        verification: {
+          status: newStatus === "HELD" ? "SUPPORTED" : newStatus === "FAILED" ? "CONTRADICTED" : "UNRESOLVED",
+          confidence: Math.abs(deltaPct) > 5 ? "high" : Math.abs(deltaPct) > 2 ? "medium" : "low",
+          kpiUsed: { key: bestKpiKey, label: bestLabel },
+          comparison: {
+            before: bestDataPoints.before ? {
+              period: bestDataPoints.before.period,
+              value: bestDataPoints.before.value,
+              unit: bestDataPoints.before.unit,
+              filedDate: bestDataPoints.before.filedDate,
+            } : null,
+            after: {
+              period: bestDataPoints.after.period,
+              value: bestDataPoints.after.value,
+              unit: bestDataPoints.after.unit,
+              filedDate: bestDataPoints.after.filedDate,
+            },
+            deltaAbs,
+            deltaPct,
+          },
+          notes: `Auto-verifierad via KPI: ${bestLabel} ${valueIncreased ? 'ökade' : 'minskade'} med ${Math.abs(deltaPct).toFixed(2)}%`,
+          reasoning: [`Auto-verifierad via KPI: ${bestLabel}`],
+        },
+      });
 
       updatedPromises.push(updatedPromise);
     } catch (error) {
       console.error(`[autoVerify] Error verifying promise:`, error);
-      updatedPromises.push(promise);
+      updatedPromises.push(normalized);
     }
   }
 
@@ -1089,6 +1134,7 @@ export function verifyPromiseWithKpis(
 /**
  * Verifierar promises med normaliserad KPI-map och enklare regler (MVP).
  * Returnerar både VerificationResult och PromiseWithScore med uppdaterad score.
+ * VIKTIGT: Alla promises normaliseras så att verification och score alltid är null (inte undefined).
  */
 export function verifyPromisesWithNormalizedKpis(
   promises: PromiseForVerification[],
@@ -1224,15 +1270,16 @@ export function verifyPromisesWithNormalizedKpis(
       };
       results.set(i, result);
       
-      const updatedPromise: PromiseWithScore = {
+      const updatedPromise: PromiseWithScore = normalizePromise({
         ...promise,
+        verification: result,
         score: {
           score0to100: 0,
           status: "UNCLEAR",
           reasons: [`Ingen KPI-data för ${promiseType}`],
           scoredAt: new Date().toISOString(),
         },
-      };
+      });
       updatedPromises.push(updatedPromise);
       resultsCounts.unclear++;
       continue;
@@ -1354,8 +1401,9 @@ export function verifyPromisesWithNormalizedKpis(
     };
     results.set(i, result);
     
-    const updatedPromise: PromiseWithScore = {
+    const updatedPromise: PromiseWithScore = normalizePromise({
       ...promise,
+      verification: result,
       score: {
         score0to100: scoreStatus === "HELD" ? 80 : scoreStatus === "MIXED" ? 50 : scoreStatus === "FAILED" ? 20 : 0,
         status: scoreStatus,
@@ -1366,7 +1414,7 @@ export function verifyPromisesWithNormalizedKpis(
         delta: { abs: deltaAbs, pct: deltaPct },
         verifiedAt: new Date().toISOString(),
       },
-    };
+    });
     updatedPromises.push(updatedPromise);
   }
   

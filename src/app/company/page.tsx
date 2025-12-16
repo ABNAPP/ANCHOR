@@ -887,8 +887,8 @@ export default function CompanyPage() {
         return;
       }
 
-      // Hantera response
-      if (!res.ok || !data.ok) {
+      // Hantera response - nytt format: success: true/false
+      if (!res.ok || data.success === false) {
         const errorCode = data.error?.code || "UNKNOWN_ERROR";
         const errorMsg = data.error?.message || data.message || "Scoring misslyckades";
         const errorDetails = data.error?.details 
@@ -900,14 +900,13 @@ export default function CompanyPage() {
         return;
       }
 
-      // Success
-      const result = data.data;
-      if (result) {
-        console.log("[score] Success:", result);
-        setCompanyScore(result.companyScore ?? null);
+      // Success - data är direkt i root (inte data.data)
+      if (data.success === true) {
+        console.log("[score] Success:", data);
+        setCompanyScore(data.companyScore ?? null);
         
         // Uppdatera promises med scores från response
-        if (result.promises && Array.isArray(result.promises)) {
+        if (data.promises && Array.isArray(data.promises)) {
           setExtractResponse((prev) => {
             if (!prev) return prev;
             return {
@@ -915,19 +914,25 @@ export default function CompanyPage() {
               extraction: {
                 ...prev.extraction,
                 promises: prev.extraction.promises.map((p, idx) => {
-                  const scoredPromise = result.promises[idx];
+                  const scoredPromise = data.promises[idx];
                   if (scoredPromise?.score) {
                     return {
                       ...p,
                       score: scoredPromise.score,
+                      verification: scoredPromise.verification ?? null,
                     };
                   }
                   return p;
                 }),
               },
+              companyScore: data.companyScore ?? null,
             };
           });
         }
+      } else {
+        // Fallback om success saknas (bör inte hända med ny API)
+        console.warn("[score] Response missing success field:", data);
+        addDebugError("score", new Error("Oväntat response-format från score-doc API"));
       }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
