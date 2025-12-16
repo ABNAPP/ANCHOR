@@ -316,6 +316,67 @@ export default function CompanyPage() {
     return Array.from(keys).sort();
   }, [kpiResponse]);
 
+  // Score statistics
+  const scoreStats = useMemo(() => {
+    const promises = extractResponse?.extraction?.promises || [];
+    
+    const scoredPromises = promises.filter((p) => {
+      if (!p?.score) return false;
+      const score = typeof p.score.score0to100 === "string" 
+        ? parseFloat(p.score.score0to100) 
+        : typeof p.score.score0to100 === "number"
+        ? p.score.score0to100
+        : null;
+      return score !== null && !isNaN(score);
+    });
+
+    if (scoredPromises.length === 0) {
+      return {
+        hasScoring: false,
+        counts: { HELD: 0, MIXED: 0, FAILED: 0, UNCLEAR: 0 },
+        scoredCount: 0,
+        top5: [],
+        bottom5: [],
+      };
+    }
+
+    const counts = { HELD: 0, MIXED: 0, FAILED: 0, UNCLEAR: 0 };
+    scoredPromises.forEach((p) => {
+      const status = p.score?.status;
+      if (status && (status === "HELD" || status === "MIXED" || status === "FAILED" || status === "UNCLEAR")) {
+        counts[status]++;
+      }
+    });
+
+    const scoredCount = scoredPromises.filter((p) => p.score?.status !== "UNCLEAR").length;
+
+    // Sort by score (normalize to number)
+    const sorted = [...scoredPromises].sort((a, b) => {
+      const scoreA = typeof a.score?.score0to100 === "string" 
+        ? parseFloat(a.score.score0to100) 
+        : typeof a.score?.score0to100 === "number"
+        ? a.score.score0to100
+        : 0;
+      const scoreB = typeof b.score?.score0to100 === "string" 
+        ? parseFloat(b.score.score0to100) 
+        : typeof b.score?.score0to100 === "number"
+        ? b.score.score0to100
+        : 0;
+      return scoreB - scoreA;
+    });
+
+    const top5 = sorted.slice(0, 5);
+    const bottom5 = sorted.slice(-5).reverse();
+
+    return {
+      hasScoring: true,
+      counts,
+      scoredCount,
+      top5,
+      bottom5,
+    };
+  }, [extractResponse]);
+
   // ============================================
   // DEBUG HELPERS
   // ============================================
@@ -1235,6 +1296,154 @@ export default function CompanyPage() {
                     </div>
                   </div>
                 </div>
+
+                {/* Score Summary Panel */}
+                {scoreStats.hasScoring ? (
+                  <div style={styles.scoreSummaryPanel}>
+                    <h3 style={styles.sectionTitle}>📊 Score Summary</h3>
+                    
+                    <div style={styles.scoreSummaryGrid}>
+                      <div style={styles.scoreSummaryCard}>
+                        <div style={styles.scoreSummaryValue}>
+                          {companyScore !== null ? companyScore.toFixed(0) : "N/A"}
+                        </div>
+                        <div style={styles.scoreSummaryLabel}>Company Score</div>
+                      </div>
+                      
+                      <div style={styles.scoreSummaryCard}>
+                        <div style={styles.scoreSummaryValue}>{scoreStats.scoredCount}</div>
+                        <div style={styles.scoreSummaryLabel}>Scored Promises</div>
+                      </div>
+                    </div>
+
+                    <div style={styles.scoreCountsGrid}>
+                      <div style={{...styles.scoreCountBadge, backgroundColor: "rgba(34, 197, 94, 0.1)", color: "var(--accent-green)"}}>
+                        ✅ HELD: {scoreStats.counts.HELD}
+                      </div>
+                      <div style={{...styles.scoreCountBadge, backgroundColor: "rgba(251, 146, 60, 0.1)", color: "var(--accent-orange)"}}>
+                        ⚠️ MIXED: {scoreStats.counts.MIXED}
+                      </div>
+                      <div style={{...styles.scoreCountBadge, backgroundColor: "rgba(239, 68, 68, 0.1)", color: "var(--accent-red)"}}>
+                        ❌ FAILED: {scoreStats.counts.FAILED}
+                      </div>
+                      <div style={{...styles.scoreCountBadge, backgroundColor: "rgba(156, 163, 175, 0.1)", color: "var(--text-muted)"}}>
+                        ❓ UNCLEAR: {scoreStats.counts.UNCLEAR}
+                      </div>
+                    </div>
+
+                    {(scoreStats.top5.length > 0 || scoreStats.bottom5.length > 0) && (
+                      <div style={styles.topBottomSection}>
+                        {scoreStats.top5.length > 0 && (
+                          <div style={styles.topBottomList}>
+                            <h4 style={styles.topBottomTitle}>🏆 Top 5 Promises</h4>
+                            {scoreStats.top5.map((promise, idx) => {
+                              const score = typeof promise.score?.score0to100 === "string" 
+                                ? parseFloat(promise.score.score0to100) 
+                                : typeof promise.score?.score0to100 === "number"
+                                ? promise.score.score0to100
+                                : 0;
+                              const status = promise.score?.status || "UNCLEAR";
+                              const shortText = promise.text.length > 100 
+                                ? promise.text.substring(0, 100) + "..." 
+                                : promise.text;
+                              return (
+                                <div key={idx} style={styles.promiseSummaryItem}>
+                                  <div style={styles.promiseSummaryHeader}>
+                                    <span style={{
+                                      ...styles.promiseSummaryScore,
+                                      color: score >= 80 
+                                        ? "var(--accent-green)" 
+                                        : score >= 50 
+                                        ? "var(--accent-orange)" 
+                                        : "var(--accent-red)",
+                                    }}>
+                                      {score.toFixed(0)}
+                                    </span>
+                                    <span style={{
+                                      ...styles.promiseSummaryStatus,
+                                      backgroundColor: SCORE_STATUS_CONFIG[status]?.color + "20",
+                                      color: SCORE_STATUS_CONFIG[status]?.color,
+                                    }}>
+                                      {SCORE_STATUS_CONFIG[status]?.emoji} {SCORE_STATUS_CONFIG[status]?.label}
+                                    </span>
+                                  </div>
+                                  <div style={styles.promiseSummaryText}>{shortText}</div>
+                                  {promise.score?.reasons && promise.score.reasons.length > 0 && (
+                                    <details style={styles.promiseSummaryDetails}>
+                                      <summary style={styles.promiseSummarySummary}>Visa reasons</summary>
+                                      <ul style={styles.promiseSummaryReasons}>
+                                        {promise.score.reasons.map((reason, rIdx) => (
+                                          <li key={rIdx}>{reason}</li>
+                                        ))}
+                                      </ul>
+                                    </details>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {scoreStats.bottom5.length > 0 && (
+                          <div style={styles.topBottomList}>
+                            <h4 style={styles.topBottomTitle}>📉 Bottom 5 Promises</h4>
+                            {scoreStats.bottom5.map((promise, idx) => {
+                              const score = typeof promise.score?.score0to100 === "string" 
+                                ? parseFloat(promise.score.score0to100) 
+                                : typeof promise.score?.score0to100 === "number"
+                                ? promise.score.score0to100
+                                : 0;
+                              const status = promise.score?.status || "UNCLEAR";
+                              const shortText = promise.text.length > 100 
+                                ? promise.text.substring(0, 100) + "..." 
+                                : promise.text;
+                              return (
+                                <div key={idx} style={styles.promiseSummaryItem}>
+                                  <div style={styles.promiseSummaryHeader}>
+                                    <span style={{
+                                      ...styles.promiseSummaryScore,
+                                      color: score >= 80 
+                                        ? "var(--accent-green)" 
+                                        : score >= 50 
+                                        ? "var(--accent-orange)" 
+                                        : "var(--accent-red)",
+                                    }}>
+                                      {score.toFixed(0)}
+                                    </span>
+                                    <span style={{
+                                      ...styles.promiseSummaryStatus,
+                                      backgroundColor: SCORE_STATUS_CONFIG[status]?.color + "20",
+                                      color: SCORE_STATUS_CONFIG[status]?.color,
+                                    }}>
+                                      {SCORE_STATUS_CONFIG[status]?.emoji} {SCORE_STATUS_CONFIG[status]?.label}
+                                    </span>
+                                  </div>
+                                  <div style={styles.promiseSummaryText}>{shortText}</div>
+                                  {promise.score?.reasons && promise.score.reasons.length > 0 && (
+                                    <details style={styles.promiseSummaryDetails}>
+                                      <summary style={styles.promiseSummarySummary}>Visa reasons</summary>
+                                      <ul style={styles.promiseSummaryReasons}>
+                                        {promise.score.reasons.map((reason, rIdx) => (
+                                          <li key={rIdx}>{reason}</li>
+                                        ))}
+                                      </ul>
+                                    </details>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div style={styles.scoreSummaryPanel}>
+                    <div style={styles.scoreSummaryHint}>
+                      💡 Kör "Scorea promises" för att få scorecard och analys.
+                    </div>
+                  </div>
+                )}
 
                 <div style={styles.filtersSection}>
                   <h4 style={styles.subTitle}>Filter</h4>
@@ -2462,5 +2671,119 @@ const styles: Record<string, React.CSSProperties> = {
     backgroundColor: "var(--bg-secondary)",
     borderRadius: "6px",
     lineHeight: 1.5,
+  },
+  scoreSummaryPanel: {
+    marginBottom: "1.5rem",
+    padding: "1.5rem",
+    backgroundColor: "var(--bg-primary)",
+    borderRadius: "8px",
+    border: "1px solid var(--border-color)",
+  },
+  scoreSummaryGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, 1fr)",
+    gap: "1rem",
+    marginBottom: "1rem",
+  },
+  scoreSummaryCard: {
+    padding: "1rem",
+    backgroundColor: "var(--bg-secondary)",
+    border: "1px solid var(--border-color)",
+    borderRadius: "6px",
+    textAlign: "center",
+  },
+  scoreSummaryValue: {
+    fontSize: "2rem",
+    fontWeight: 700,
+    color: "var(--accent-blue)",
+    marginBottom: "0.25rem",
+  },
+  scoreSummaryLabel: {
+    fontSize: "0.75rem",
+    color: "var(--text-muted)",
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+  },
+  scoreCountsGrid: {
+    display: "flex",
+    gap: "0.75rem",
+    flexWrap: "wrap",
+    marginBottom: "1.5rem",
+  },
+  scoreCountBadge: {
+    padding: "0.5rem 0.75rem",
+    borderRadius: "6px",
+    fontSize: "0.85rem",
+    fontWeight: 600,
+  },
+  topBottomSection: {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, 1fr)",
+    gap: "1.5rem",
+    marginTop: "1.5rem",
+  },
+  topBottomList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.75rem",
+  },
+  topBottomTitle: {
+    fontSize: "0.9rem",
+    fontWeight: 600,
+    color: "var(--text-secondary)",
+    marginBottom: "0.5rem",
+  },
+  promiseSummaryItem: {
+    padding: "0.75rem",
+    backgroundColor: "var(--bg-secondary)",
+    border: "1px solid var(--border-color)",
+    borderRadius: "6px",
+  },
+  promiseSummaryHeader: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.5rem",
+    marginBottom: "0.5rem",
+  },
+  promiseSummaryScore: {
+    fontSize: "1.1rem",
+    fontWeight: 700,
+  },
+  promiseSummaryStatus: {
+    padding: "0.25rem 0.5rem",
+    fontSize: "0.7rem",
+    fontWeight: 600,
+    borderRadius: "4px",
+  },
+  promiseSummaryText: {
+    fontSize: "0.8rem",
+    color: "var(--text-primary)",
+    lineHeight: 1.4,
+    marginBottom: "0.5rem",
+  },
+  promiseSummaryDetails: {
+    fontSize: "0.75rem",
+    color: "var(--text-muted)",
+  },
+  promiseSummarySummary: {
+    cursor: "pointer",
+    fontWeight: 600,
+    color: "var(--accent-blue)",
+  },
+  promiseSummaryReasons: {
+    marginTop: "0.5rem",
+    paddingLeft: "1.25rem",
+    fontSize: "0.75rem",
+    color: "var(--text-muted)",
+    lineHeight: 1.5,
+  },
+  scoreSummaryHint: {
+    padding: "1rem",
+    textAlign: "center",
+    color: "var(--text-muted)",
+    fontSize: "0.9rem",
+    backgroundColor: "var(--bg-secondary)",
+    borderRadius: "6px",
+    border: "1px dashed var(--border-color)",
   },
 };
