@@ -15,7 +15,7 @@
  * - Förbättrad logging
  */
 
-import { ExtractedKpi, KpiExtractionResult, getKpiHistory } from "./kpis";
+import { ExtractedKpi, KpiExtractionResult, getKpiHistory, NormalizedKpiMap, createNormalizedKpiMap } from "./kpis";
 import { PromiseType } from "./promises";
 
 // ============================================
@@ -193,28 +193,28 @@ const KPI_DIRECTION_POSITIVE: Record<string, boolean> = {
 // ============================================
 
 /**
- * Infererar promise type från text med keywords.
+ * Infererar promise type från text med keywords (FÖRBÄTTRAD).
  */
 function inferPromiseTypeFromText(text: string): PromiseType | null {
   const lower = text.toLowerCase();
   
-  // REVENUE keywords
-  if (lower.match(/\b(revenue|sales|revenues|netsales|top.?line)\b/)) {
+  // REVENUE keywords (utökad)
+  if (lower.match(/\b(revenue|sales|revenues|netsales|top.?line|demand|reseller.?sales|product.?sales)\b/)) {
     return "REVENUE";
   }
   
-  // MARGIN keywords
-  if (lower.match(/\b(margin|gross.?margin|operating.?margin|profitability)\b/)) {
+  // MARGIN keywords (utökad)
+  if (lower.match(/\b(margin|gross.?margin|operating.?margin|profitability|profit|earnings)\b/)) {
     return "MARGIN";
   }
   
-  // CAPEX keywords
-  if (lower.match(/\b(capex|capital.?expenditure|invest|property|plant|equipment|infrastructure)\b/)) {
+  // CAPEX keywords (utökad)
+  if (lower.match(/\b(capex|capital.?expenditure|invest|investment|spend|build|data.?center|property|plant|equipment|infrastructure|facilities)\b/)) {
     return "CAPEX";
   }
   
-  // COSTS keywords
-  if (lower.match(/\b(cost|expense|efficiency|operating.?expense|cogs|cost.?of.?revenue)\b/)) {
+  // COSTS keywords (utökad)
+  if (lower.match(/\b(cost|expense|efficiency|operating.?expense|cogs|cost.?of.?revenue|savings|headcount|reduce.?costs|lower.?expenses)\b/)) {
     return "COSTS";
   }
   
@@ -573,7 +573,19 @@ export function autoVerifyUnclearPromises(
     }
 
     try {
-      const mapping = PROMISE_TYPE_TO_KPI[promise.type];
+      // Normalisera promise type
+      const normalizedType = normalizePromiseType(promise.type);
+      
+      // Försök inferera type om OTHER eller om type inte matchar någon KPI
+      let promiseType = normalizedType;
+      if (normalizedType === "OTHER" || !PROMISE_TYPE_TO_KPI[normalizedType] || PROMISE_TYPE_TO_KPI[normalizedType].primary.length === 0) {
+        const inferred = inferPromiseTypeFromText(promise.text);
+        if (inferred) {
+          promiseType = inferred;
+        }
+      }
+      
+      const mapping = PROMISE_TYPE_TO_KPI[promiseType];
       
       if (!mapping || mapping.primary.length === 0) {
         updatedPromises.push(promise);
@@ -584,7 +596,7 @@ export function autoVerifyUnclearPromises(
       let bestLabel: string = "";
       let bestDataPoints: { before: ExtractedKpi | null; after: ExtractedKpi | null } | null = null;
 
-      if (promise.type === "MARGIN" && mapping.calculated) {
+      if (promiseType === "MARGIN" && mapping.calculated) {
         const marginData = calculateMarginDataPoints(
           kpiResult,
           mapping.calculated.revenueKey,
@@ -625,7 +637,7 @@ export function autoVerifyUnclearPromises(
       }
 
       if (!bestDataPoints || !bestDataPoints.after || !bestDataPoints.before) {
-        const kpiKeys = findKpiKeysForPromiseType(promise.type);
+        const kpiKeys = findKpiKeysForPromiseType(promiseType);
         const found = findFirstAvailableKpi(
           kpiResult, 
           kpiKeys, 
@@ -637,6 +649,29 @@ export function autoVerifyUnclearPromises(
           bestKpiKey = found.key;
           bestLabel = found.label;
           bestDataPoints = found.dataPoints;
+        } else if (kpiKeys.length === 0 && mapping.fuzzyMatch) {
+          // Om inga exakta keys, försök direkt fuzzy match
+          const fuzzyMatches = findKpiByFuzzyMatch(kpiResult, mapping.fuzzyMatch);
+          if (fuzzyMatches.length > 0) {
+            const keyGroups = new Map<string, ExtractedKpi[]>();
+            for (const kpi of fuzzyMatches) {
+              if (!keyGroups.has(kpi.key)) {
+                keyGroups.set(kpi.key, []);
+              }
+              keyGroups.get(kpi.key)!.push(kpi);
+            }
+            
+            for (const [fuzzyKey, kpis] of keyGroups.entries()) {
+              const dataPoints = findKpiDataPoints(kpiResult, fuzzyKey, true);
+              if (dataPoints.after && dataPoints.before) {
+                const kpiSample = kpis[0];
+                bestKpiKey = fuzzyKey;
+                bestLabel = kpiSample.label || fuzzyKey;
+                bestDataPoints = dataPoints;
+                break;
+              }
+            }
+          }
         }
       }
 
@@ -727,6 +762,29 @@ export function autoVerifyUnclearPromises(
 // ============================================
 
 /**
+ * Normaliserar promise type till uppercase och hanterar edge cases.
+ */
+function normalizePromiseType(type: string | undefined): PromiseType {
+  if (!type) return "OTHER";
+  
+  const upper = type.toUpperCase();
+  
+  // Mappa kända varianter
+  if (upper === "PRODUCT" || upper === "PRODUCTS") return "PRODUCT";
+  if (upper === "MARKET" || upper === "MARKETS") return "MARKET";
+  if (upper === "REVENUE" || upper === "REVENUES") return "REVENUE";
+  if (upper === "COSTS" || upper === "COST") return "COSTS";
+  if (upper === "CAPEX" || upper === "CAPITALEXPENDITURE") return "CAPEX";
+  if (upper === "DEBT") return "DEBT";
+  if (upper === "MARGIN" || upper === "MARGINS") return "MARGIN";
+  if (upper === "STRATEGY" || upper === "STRATEGIC" || upper === "RISK") return "STRATEGY";
+  if (upper === "OTHER" || upper === "UNKNOWN") return "OTHER";
+  
+  // Fallback
+  return "OTHER";
+}
+
+/**
  * Verifierar en promise mot KPI-data med förbättrad mapping och fuzzy matching.
  */
 export function verifyPromiseWithKpis(
@@ -735,13 +793,17 @@ export function verifyPromiseWithKpis(
 ): VerificationResult {
   const reasoning: string[] = [];
   
-  // Försök inferera type om OTHER eller saknas
-  let promiseType = promise.type;
-  if (promiseType === "OTHER" || !promiseType) {
+  // Normalisera promise type (hantera olika casing och varianter)
+  let promiseType = normalizePromiseType(promise.type);
+  
+  // Försök inferera type om OTHER eller om type inte matchar någon KPI
+  if (promiseType === "OTHER" || !PROMISE_TYPE_TO_KPI[promiseType] || PROMISE_TYPE_TO_KPI[promiseType].primary.length === 0) {
     const inferred = inferPromiseTypeFromText(promise.text);
     if (inferred) {
       promiseType = inferred;
-      reasoning.push(`Infererade promise type: ${inferred} från text`);
+      reasoning.push(`Infererade promise type: ${inferred} från text (original: ${promise.type})`);
+    } else {
+      reasoning.push(`Promise type ${promise.type} normaliserad till ${promiseType}, ingen KPI-mapping`);
     }
   }
   
@@ -847,6 +909,8 @@ export function verifyPromiseWithKpis(
   // Steg 2: Om ingen beräknad margin, prova direkta KPIs med fuzzy matching
   if (!bestDataPoints || !bestDataPoints.after) {
     const kpiKeys = findKpiKeysForPromiseType(promiseType);
+    reasoning.push(`Söker KPI för type ${promiseType}, försöker keys: ${kpiKeys.join(", ") || "ingen"}`);
+    
     const found = findFirstAvailableKpi(
       kpiResult, 
       kpiKeys, 
@@ -854,11 +918,48 @@ export function verifyPromiseWithKpis(
       mapping.fuzzyMatch
     );
     
-    if (found) {
+    if (found && found.dataPoints.after) {
       bestKpiKey = found.key;
       bestLabel = found.label;
       bestDataPoints = found.dataPoints;
       reasoning.push(`Hittade KPI "${found.label}" (${found.key})`);
+    } else if (mapping.fuzzyMatch && mapping.fuzzyMatch.length > 0) {
+      // Om inga exakta keys matchade, försök direkt fuzzy match mot alla tillgängliga KPIs
+      reasoning.push(`Ingen exakt match, försöker fuzzy match med keywords: ${mapping.fuzzyMatch.join(", ")}`);
+      const fuzzyMatches = findKpiByFuzzyMatch(kpiResult, mapping.fuzzyMatch);
+      
+      if (fuzzyMatches.length > 0) {
+        reasoning.push(`Fuzzy match hittade ${fuzzyMatches.length} KPIs`);
+        const keyGroups = new Map<string, ExtractedKpi[]>();
+        for (const kpi of fuzzyMatches) {
+          if (!keyGroups.has(kpi.key)) {
+            keyGroups.set(kpi.key, []);
+          }
+          keyGroups.get(kpi.key)!.push(kpi);
+        }
+        
+        for (const [fuzzyKey, kpis] of keyGroups.entries()) {
+          const dataPoints = findKpiDataPoints(kpiResult, fuzzyKey, true);
+          if (dataPoints.after && dataPoints.before) {
+            const kpiSample = kpis[0];
+            bestKpiKey = fuzzyKey;
+            bestLabel = kpiSample.label || fuzzyKey;
+            bestDataPoints = dataPoints;
+            reasoning.push(`Hittade KPI via fuzzy match: "${bestLabel}" (${fuzzyKey})`);
+            break;
+          } else if (dataPoints.after) {
+            // Om vi har after men inte before, använd det ändå (PENDING)
+            const kpiSample = kpis[0];
+            bestKpiKey = fuzzyKey;
+            bestLabel = kpiSample.label || fuzzyKey;
+            bestDataPoints = dataPoints;
+            reasoning.push(`Hittade KPI via fuzzy match (endast senaste värde): "${bestLabel}" (${fuzzyKey})`);
+            break;
+          }
+        }
+      } else {
+        reasoning.push(`Fuzzy match hittade inga KPIs`);
+      }
     }
   }
 
@@ -986,6 +1087,309 @@ export function verifyPromiseWithKpis(
 }
 
 /**
+ * Verifierar promises med normaliserad KPI-map och enklare regler (MVP).
+ * Returnerar både VerificationResult och PromiseWithScore med uppdaterad score.
+ */
+export function verifyPromisesWithNormalizedKpis(
+  promises: PromiseForVerification[],
+  kpiResult: KpiExtractionResult
+): { 
+  results: Map<number, VerificationResult>;
+  updatedPromises: PromiseWithScore[];
+  debugMeta: {
+    totalPromises: number;
+    promiseTypeCounts: Record<string, number>;
+    inferredTypeCounts: Record<string, number>;
+    availableKpiKeysSample: string[];
+    selectedKpisUsed: string[];
+    resultsCounts: { held: number; mixed: number; failed: number; unclear: number };
+  };
+} {
+  console.log(`[verify] Starting verification with normalized KPIs: ${promises.length} promises`);
+  
+  // Skapa normaliserad KPI-map
+  const normalizedMap = createNormalizedKpiMap(kpiResult);
+  
+  // Logga tillgängliga KPIs
+  const availableKpiKeys = Array.from(new Set(kpiResult.kpis.map(k => k.key))).slice(0, 30);
+  console.log(`[verify] Available KPI keys (top 30):`, availableKpiKeys);
+  
+  // Räkna promise types (original och normaliserade)
+  const promiseTypeCounts: Record<string, number> = {};
+  const inferredTypeCounts: Record<string, number> = {};
+  const selectedKpisUsed = new Set<string>();
+  const results = new Map<number, VerificationResult>();
+  const updatedPromises: PromiseWithScore[] = [];
+  
+  const resultsCounts = { held: 0, mixed: 0, failed: 0, unclear: 0 };
+  
+  for (let i = 0; i < promises.length; i++) {
+    const promise = promises[i];
+    const originalType = promise.type || "UNKNOWN";
+    promiseTypeCounts[originalType] = (promiseTypeCounts[originalType] || 0) + 1;
+    
+    // Normalisera och inferera type
+    let promiseType = normalizePromiseType(promise.type);
+    if (promiseType === "OTHER" || promiseType === "STRATEGY" || promiseType === "PRODUCT" || promiseType === "MARKET") {
+      const inferred = inferPromiseTypeFromText(promise.text);
+      if (inferred) {
+        promiseType = inferred;
+        inferredTypeCounts[inferred] = (inferredTypeCounts[inferred] || 0) + 1;
+      }
+    }
+    
+    // Hitta relevant KPI från normaliserad map
+    let kpiData: { latest: ExtractedKpi | null; prev: ExtractedKpi | null } | null = null;
+    let kpiKey = "";
+    let kpiLabel = "";
+    
+    if (promiseType === "REVENUE") {
+      kpiData = normalizedMap.REVENUE;
+      kpiKey = "revenue";
+      kpiLabel = "Revenue";
+    } else if (promiseType === "CAPEX") {
+      kpiData = normalizedMap.CAPEX;
+      kpiKey = "capex";
+      kpiLabel = "CapEx";
+    } else if (promiseType === "COSTS") {
+      // Försök OPEX först, sedan COGS
+      if (normalizedMap.OPEX.latest) {
+        kpiData = normalizedMap.OPEX;
+        kpiKey = "operatingExpenses";
+        kpiLabel = "Operating Expenses";
+      } else if (normalizedMap.COGS.latest) {
+        kpiData = normalizedMap.COGS;
+        kpiKey = "cogs";
+        kpiLabel = "Cost of Goods Sold";
+      }
+    } else if (promiseType === "MARGIN") {
+      // Beräkna margin proxy
+      if (normalizedMap.REVENUE.latest && normalizedMap.REVENUE.prev && 
+          normalizedMap.OPERATING_INCOME.latest && normalizedMap.OPERATING_INCOME.prev) {
+        const latestMargin = normalizedMap.OPERATING_INCOME.latest.value / normalizedMap.REVENUE.latest.value;
+        const prevMargin = normalizedMap.OPERATING_INCOME.prev.value / normalizedMap.REVENUE.prev.value;
+        const marginDelta = latestMargin - prevMargin;
+        
+        // Skapa syntetiska KPI-objekt för margin
+        kpiData = {
+          latest: {
+            ...normalizedMap.OPERATING_INCOME.latest,
+            value: latestMargin,
+            key: "operatingMargin",
+            label: "Operating Margin",
+          },
+          prev: {
+            ...normalizedMap.OPERATING_INCOME.prev,
+            value: prevMargin,
+            key: "operatingMargin",
+            label: "Operating Margin",
+          },
+        };
+        kpiKey = "operatingMargin";
+        kpiLabel = "Operating Margin";
+      } else if (normalizedMap.REVENUE.latest && normalizedMap.REVENUE.prev && 
+                 normalizedMap.GROSS_PROFIT.latest && normalizedMap.GROSS_PROFIT.prev) {
+        const latestMargin = normalizedMap.GROSS_PROFIT.latest.value / normalizedMap.REVENUE.latest.value;
+        const prevMargin = normalizedMap.GROSS_PROFIT.prev.value / normalizedMap.REVENUE.prev.value;
+        const marginDelta = latestMargin - prevMargin;
+        
+        kpiData = {
+          latest: {
+            ...normalizedMap.GROSS_PROFIT.latest,
+            value: latestMargin,
+            key: "grossMargin",
+            label: "Gross Margin",
+          },
+          prev: {
+            ...normalizedMap.GROSS_PROFIT.prev,
+            value: prevMargin,
+            key: "grossMargin",
+            label: "Gross Margin",
+          },
+        };
+        kpiKey = "grossMargin";
+        kpiLabel = "Gross Margin";
+      }
+    }
+    
+    // Verifiera om vi har KPI-data
+    if (!kpiData || !kpiData.latest || !kpiData.prev) {
+      const result: VerificationResult = {
+        status: "UNRESOLVED",
+        confidence: "low",
+        kpiUsed: null,
+        comparison: { before: null, after: null, deltaAbs: null, deltaPct: null },
+        notes: `Relevant KPI saknas för ${promiseType}`,
+        reasoning: [`Ingen KPI-data hittades för ${promiseType}`],
+      };
+      results.set(i, result);
+      
+      const updatedPromise: PromiseWithScore = {
+        ...promise,
+        score: {
+          score0to100: 0,
+          status: "UNCLEAR",
+          reasons: [`Ingen KPI-data för ${promiseType}`],
+          scoredAt: new Date().toISOString(),
+        },
+      };
+      updatedPromises.push(updatedPromise);
+      resultsCounts.unclear++;
+      continue;
+    }
+    
+    selectedKpisUsed.add(kpiKey);
+    
+    // Beräkna delta
+    const latest = kpiData.latest.value;
+    const prev = kpiData.prev.value;
+    const deltaAbs = latest - prev;
+    const deltaPct = prev !== 0 ? (deltaAbs / Math.abs(prev)) * 100 : 0;
+    
+    // Bestäm claim direction från text
+    const lowerText = promise.text.toLowerCase();
+    const isPositiveClaim = lowerText.match(/\b(increase|growth|improve|expand|grow|raise|higher|more|continue to invest|expect growth)\b/);
+    const isCostReduction = lowerText.match(/\b(reduce costs|cost savings|lower expenses|decrease costs|cut costs|efficiency)\b/);
+    
+    // Bestäm status baserat på regler
+    let status: VerificationStatus = "UNRESOLVED";
+    let scoreStatus: "HELD" | "MIXED" | "FAILED" | "UNCLEAR" = "UNCLEAR";
+    const reasons: string[] = [];
+    
+    if (promiseType === "REVENUE") {
+      if (deltaPct > 2) {
+        status = "SUPPORTED";
+        scoreStatus = "HELD";
+        reasons.push(`Revenue ökade med ${deltaPct.toFixed(2)}%`);
+      } else if (deltaPct < -2) {
+        status = "CONTRADICTED";
+        scoreStatus = "FAILED";
+        reasons.push(`Revenue minskade med ${Math.abs(deltaPct).toFixed(2)}%`);
+      } else {
+        status = "UNRESOLVED";
+        scoreStatus = "MIXED";
+        reasons.push(`Revenue nästan oförändrad (${deltaPct.toFixed(2)}%)`);
+      }
+    } else if (promiseType === "CAPEX") {
+      if (deltaPct > 2) {
+        status = "SUPPORTED";
+        scoreStatus = "HELD";
+        reasons.push(`CapEx ökade med ${deltaPct.toFixed(2)}% (mer investering)`);
+      } else if (deltaPct < -2) {
+        status = "CONTRADICTED";
+        scoreStatus = "FAILED";
+        reasons.push(`CapEx minskade med ${Math.abs(deltaPct).toFixed(2)}%`);
+      } else {
+        status = "UNRESOLVED";
+        scoreStatus = "MIXED";
+        reasons.push(`CapEx nästan oförändrad (${deltaPct.toFixed(2)}%)`);
+      }
+    } else if (promiseType === "COSTS") {
+      if (isCostReduction) {
+        // För cost reduction: minskning är positivt
+        if (deltaPct < -2) {
+          status = "SUPPORTED";
+          scoreStatus = "HELD";
+          reasons.push(`Kostnader minskade med ${Math.abs(deltaPct).toFixed(2)}% (cost savings)`);
+        } else if (deltaPct > 2) {
+          status = "CONTRADICTED";
+          scoreStatus = "FAILED";
+          reasons.push(`Kostnader ökade med ${deltaPct.toFixed(2)}% (motsäger cost savings)`);
+        } else {
+          status = "UNRESOLVED";
+          scoreStatus = "MIXED";
+          reasons.push(`Kostnader nästan oförändrade (${deltaPct.toFixed(2)}%)`);
+        }
+      } else {
+        // Neutral cost claim
+        status = "UNRESOLVED";
+        scoreStatus = "MIXED";
+        reasons.push(`Kostnader ändrade med ${deltaPct.toFixed(2)}% (neutral claim)`);
+      }
+    } else if (promiseType === "MARGIN") {
+      const marginDelta = latest - prev;
+      if (marginDelta > 0.005) {
+        status = "SUPPORTED";
+        scoreStatus = "HELD";
+        reasons.push(`Margin förbättrades med ${(marginDelta * 100).toFixed(2)}pp`);
+      } else if (marginDelta < -0.005) {
+        status = "CONTRADICTED";
+        scoreStatus = "FAILED";
+        reasons.push(`Margin försämrades med ${(Math.abs(marginDelta) * 100).toFixed(2)}pp`);
+      } else {
+        status = "UNRESOLVED";
+        scoreStatus = "MIXED";
+        reasons.push(`Margin nästan oförändrad (${(marginDelta * 100).toFixed(2)}pp)`);
+      }
+    }
+    
+    // Uppdatera resultsCounts
+    if (scoreStatus === "HELD") resultsCounts.held++;
+    else if (scoreStatus === "MIXED") resultsCounts.mixed++;
+    else if (scoreStatus === "FAILED") resultsCounts.failed++;
+    else resultsCounts.unclear++;
+    
+    const result: VerificationResult = {
+      status,
+      confidence: Math.abs(deltaPct) > 5 ? "high" : Math.abs(deltaPct) > 2 ? "medium" : "low",
+      kpiUsed: { key: kpiKey, label: kpiLabel },
+      comparison: {
+        before: kpiData.prev ? {
+          period: kpiData.prev.period,
+          value: kpiData.prev.value,
+          unit: kpiData.prev.unit,
+          filedDate: kpiData.prev.filedDate,
+        } : null,
+        after: {
+          period: kpiData.latest.period,
+          value: kpiData.latest.value,
+          unit: kpiData.latest.unit,
+          filedDate: kpiData.latest.filedDate,
+        },
+        deltaAbs,
+        deltaPct,
+      },
+      notes: reasons.join("; "),
+      reasoning: reasons,
+    };
+    results.set(i, result);
+    
+    const updatedPromise: PromiseWithScore = {
+      ...promise,
+      score: {
+        score0to100: scoreStatus === "HELD" ? 80 : scoreStatus === "MIXED" ? 50 : scoreStatus === "FAILED" ? 20 : 0,
+        status: scoreStatus,
+        reasons,
+        scoredAt: new Date().toISOString(),
+        verifiedBy: "kpi",
+        comparedKpi: { key: kpiKey, label: kpiLabel },
+        delta: { abs: deltaAbs, pct: deltaPct },
+        verifiedAt: new Date().toISOString(),
+      },
+    };
+    updatedPromises.push(updatedPromise);
+  }
+  
+  console.log(`[verify] Verification complete:`);
+  console.log(`[verify]   Total promises: ${promises.length}`);
+  console.log(`[verify]   Matched KPI: ${Array.from(selectedKpisUsed).length}`);
+  console.log(`[verify]   Result counts: HELD=${resultsCounts.held}, MIXED=${resultsCounts.mixed}, FAILED=${resultsCounts.failed}, UNCLEAR=${resultsCounts.unclear}`);
+  
+  return {
+    results,
+    updatedPromises,
+    debugMeta: {
+      totalPromises: promises.length,
+      promiseTypeCounts,
+      inferredTypeCounts,
+      availableKpiKeysSample: availableKpiKeys,
+      selectedKpisUsed: Array.from(selectedKpisUsed),
+      resultsCounts,
+    },
+  };
+}
+
+/**
  * Batch-verifierar flera promises mot KPI-data med logging.
  */
 export function verifyMultiplePromises(
@@ -994,19 +1398,30 @@ export function verifyMultiplePromises(
 ): Map<number, VerificationResult> {
   console.log(`[verify] Starting batch verification: ${promises.length} promises`);
   
-  // Räkna promise types
+  // Räkna promise types (normaliserade)
   const typeCounts: Record<string, number> = {};
+  const originalTypeCounts: Record<string, number> = {};
   promises.forEach(p => {
-    const type = p.type || "UNKNOWN";
-    typeCounts[type] = (typeCounts[type] || 0) + 1;
+    const originalType = p.type || "UNKNOWN";
+    const normalizedType = normalizePromiseType(p.type);
+    
+    originalTypeCounts[originalType] = (originalTypeCounts[originalType] || 0) + 1;
+    typeCounts[normalizedType] = (typeCounts[normalizedType] || 0) + 1;
   });
   
-  const topTypes = Object.entries(typeCounts)
+  const topTypes = Object.entries(originalTypeCounts)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 10)
     .map(([type, count]) => `${type}:${count}`)
     .join(", ");
-  console.log(`[verify] Promise types (top 10): ${topTypes}`);
+  console.log(`[verify] Promise types (top 10, original): ${topTypes}`);
+  
+  const topNormalized = Object.entries(typeCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([type, count]) => `${type}:${count}`)
+    .join(", ");
+  console.log(`[verify] Promise types (top 10, normalized): ${topNormalized}`);
   
   const results = new Map<number, VerificationResult>();
   let matchedCount = 0;

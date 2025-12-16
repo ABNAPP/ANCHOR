@@ -23,8 +23,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { getFirestoreDb, COMPANY_PROMISES_COLLECTION } from "@/lib/firebase/admin";
 import { scorePromise } from "@/lib/company/scoring";
-import { PromiseForVerification, VerificationResult } from "@/lib/company/verify";
+import { PromiseForVerification, VerificationResult, verifyPromisesWithNormalizedKpis, PromiseWithScore } from "@/lib/company/verify";
 import { calculateCompanyScore } from "@/lib/company/score";
+import { extractKpisFromCompanyFacts } from "@/lib/company/kpis";
+import { fetchCompanyFacts } from "@/lib/sec/client";
 
 interface ScoreDocRequest {
   promiseDocId?: string;
@@ -176,99 +178,134 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     const data = snap.data() as FirestorePromiseDoc;
     const promises = data.promises || [];
-    console.log(`[score] Found document with ${promises.length} promises`);
+    const cik10 = (data as any).cik10 || "";
+    console.log(`[score] Found document with ${promises.length} promises, cik10: ${cik10}`);
 
     if (promises.length === 0) {
       console.warn("[score] Document has no promises");
       return NextResponse.json(
         {
-          ok: true,
-          data: {
-            companyScore: null,
-            scoredCount: 0,
+          success: true,
+          companyScore: null,
+          scoredCount: 0,
+          breakdown: { held: 0, mixed: 0, failed: 0, unclear: 0 },
+          promises: [],
+          debugMeta: {
             totalPromises: 0,
-            breakdown: { held: 0, mixed: 0, failed: 0, unclear: 0 },
-            promises: [],
+            promiseTypeCounts: {},
+            inferredTypeCounts: {},
+            availableKpiKeysSample: [],
+            selectedKpisUsed: [],
+            resultsCounts: { held: 0, mixed: 0, failed: 0, unclear: 0 },
           },
         }
       );
     }
 
-    // Debug: Räkna promises med/s utan verification
-    const promisesWithVerification = promises.filter(p => p.verification && p.verification.kpiUsed).length;
-    const promisesWithoutVerification = promises.length - promisesWithVerification;
-    console.log(`[score] Promises with verification: ${promisesWithVerification}, without: ${promisesWithoutVerification}`);
+    // 3) Hämta KPI-data om cik10 finns
+    let kpiResult = null;
+    if (cik10) {
+      try {
+        console.log(`[score] Fetching KPI data for CIK ${cik10}...`);
+        const companyFacts = await fetchCompanyFacts(cik10);
+        kpiResult = extractKpisFromCompanyFacts(companyFacts);
+        console.log(`[score] KPI data fetched: ${kpiResult.kpis.length} data points`);
+      } catch (kpiError) {
+        console.error(`[score] Failed to fetch KPI data:`, kpiError);
+        // Fortsätt utan KPI-data
+      }
+    }
 
-    // Debug: Räkna promise-typer
-    const promiseTypeCounts: Record<string, number> = {};
-    promises.forEach((p) => {
-      const type = p.type || "UNKNOWN";
-      promiseTypeCounts[type] = (promiseTypeCounts[type] || 0) + 1;
-    });
-    console.log(`[score] Promise types:`, promiseTypeCounts);
+    // 4) Verifiera promises med normaliserad KPI-map om KPI-data finns
+    let verificationResults: Map<number, VerificationResult> | null = null;
+    let updatedPromises: PromiseWithScore[] = [];
+    let debugMeta: any = {
+      totalPromises: promises.length,
+      promiseTypeCounts: {},
+      inferredTypeCounts: {},
+      availableKpiKeysSample: [],
+      selectedKpisUsed: [],
+      resultsCounts: { held: 0, mixed: 0, failed: 0, unclear: 0 },
+    };
 
-    // 4) Score varje promise
+    if (kpiResult) {
+      console.log(`[score] Verifying promises with normalized KPIs...`);
+      const promisesForVerification: PromiseForVerification[] = promises.map(p => mapPromiseForVerification(p));
+      const verifyResult = verifyPromisesWithNormalizedKpis(promisesForVerification, kpiResult);
+      verificationResults = verifyResult.results;
+      updatedPromises = verifyResult.updatedPromises;
+      debugMeta = verifyResult.debugMeta;
+      console.log(`[score] Verification complete: HELD=${debugMeta.resultsCounts.held}, MIXED=${debugMeta.resultsCounts.mixed}, FAILED=${debugMeta.resultsCounts.failed}, UNCLEAR=${debugMeta.resultsCounts.unclear}`);
+    } else {
+      console.log(`[score] No KPI data available, skipping verification`);
+      // Skapa default promises med UNCLEAR status
+      updatedPromises = promises.map(p => ({
+        ...mapPromiseForVerification(p),
+        score: {
+          score0to100: 0,
+          status: "UNCLEAR" as const,
+          reasons: ["Ingen KPI-data tillgänglig"],
+          scoredAt: new Date().toISOString(),
+        },
+      }));
+      
+      // Räkna promise types för debugMeta
+      promises.forEach(p => {
+        const type = p.type || "UNKNOWN";
+        debugMeta.promiseTypeCounts[type] = (debugMeta.promiseTypeCounts[type] || 0) + 1;
+      });
+      debugMeta.resultsCounts.unclear = promises.length;
+    }
+
+    // 5) Score varje promise (använd verifierade promises om de finns)
     console.log("[score] Starting to score promises...");
     const scoredPromises: StoredPromise[] = [];
-    
-    // Räkna statusar för debug
-    const scoreStatusCounts = {
-      HELD: 0,
-      MIXED: 0,
-      FAILED: 0,
-      UNCLEAR: 0,
-    };
-    
-    // Skapa en timestamp som används för alla promises i denna batch
     const scoringTimestamp = new Date().toISOString();
 
     try {
-      promises.forEach((p, idx) => {
+      updatedPromises.forEach((updatedPromise, idx) => {
         try {
-          const verification = p.verification ?? buildDefaultVerification();
-          const promiseForVerification = mapPromiseForVerification(p);
+          const originalPromise = promises[idx];
+          const verification = verificationResults?.get(idx) || originalPromise.verification || buildDefaultVerification();
+          const promiseForVerification = mapPromiseForVerification(originalPromise);
 
-          // Debug: Logga om verification saknas eller har KPI
-          if (!p.verification) {
-            console.log(`[score] Promise ${idx} (${p.type}): No verification, using default UNRESOLVED`);
-          } else if (!p.verification.kpiUsed) {
-            console.log(`[score] Promise ${idx} (${p.type}): Verification exists but no KPI matched`);
+          // Om updatedPromise redan har score från verifiering, använd den
+          if (updatedPromise.score) {
+            scoredPromises.push({
+              ...originalPromise,
+              score: {
+                ...updatedPromise.score,
+                scoredAt: scoringTimestamp,
+              },
+              verification: verificationResults?.get(idx) || originalPromise.verification,
+            });
           } else {
-            console.log(`[score] Promise ${idx} (${p.type}): Verification with KPI ${p.verification.kpiUsed.key}`);
+            // Annars kör scoring
+            const scoreResult = scorePromise(promiseForVerification, verification);
+            scoredPromises.push({
+              ...originalPromise,
+              score: {
+                score0to100: scoreResult.score0to100,
+                status: scoreResult.status,
+                reasons: scoreResult.reasons,
+                scoredAt: scoringTimestamp,
+              },
+              verification,
+            });
           }
-
-          const scoreResult = scorePromise(promiseForVerification, verification);
-          
-          // Räkna statusar
-          scoreStatusCounts[scoreResult.status]++;
-
-          const scoredPromise = {
-            ...p,
-            score: {
-              score0to100: scoreResult.score0to100,
-              status: scoreResult.status,
-              reasons: scoreResult.reasons,
-              scoredAt: scoringTimestamp, // Använd ISO string istället för FieldValue (Firestore tillåter inte FieldValue i arrays)
-            },
-          };
-
-          scoredPromises.push(scoredPromise);
         } catch (promiseError) {
           console.error(`[score] Error scoring promise ${idx}:`, promiseError);
-          // Fortsätt med default score för denna promise
           const defaultVerification = buildDefaultVerification();
-          const promiseForVerification = mapPromiseForVerification(p);
+          const promiseForVerification = mapPromiseForVerification(promises[idx]);
           const scoreResult = scorePromise(promiseForVerification, defaultVerification);
           
-          scoreStatusCounts[scoreResult.status]++;
-          
           scoredPromises.push({
-            ...p,
+            ...promises[idx],
             score: {
               score0to100: scoreResult.score0to100,
               status: scoreResult.status,
-              reasons: [...scoreResult.reasons, `Error during scoring: ${promiseError instanceof Error ? promiseError.message : String(promiseError)}`],
-              scoredAt: scoringTimestamp, // Använd ISO string istället för FieldValue
+              reasons: [...scoreResult.reasons, `Error: ${promiseError instanceof Error ? promiseError.message : String(promiseError)}`],
+              scoredAt: scoringTimestamp,
             },
           });
         }
@@ -288,10 +325,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // Debug: Visa score-statusar
-    console.log(`[score] Score status breakdown:`, scoreStatusCounts);
-
-    // 5) Beräkna company score baserat på verifierade promises
+    // 6) Beräkna company score baserat på verifierade promises
     const companyScoreResult = calculateCompanyScore(scoredPromises);
     const companyScore = companyScoreResult.companyScore;
     const scoredCount = companyScoreResult.scoredCount;
@@ -301,7 +335,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     console.log(`[score]   scoredCount: ${scoredCount}`);
     console.log(`[score]   breakdown:`, companyScoreResult.breakdown);
 
-    // 6) Skriv tillbaka
+    // 7) Skriv tillbaka
     try {
       console.log("[score] Updating Firestore document...");
       await docRef.update({
@@ -314,7 +348,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       console.error("[score] Firestore update failed:", updateError);
       return NextResponse.json(
         {
-          ok: false,
+          success: false,
           error: {
             code: "FIRESTORE_UPDATE_FAILED",
             message: "Kunde inte uppdatera dokument i Firestore",
@@ -325,28 +359,32 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // 7) Returnera resultat
+    // 8) Returnera resultat med debugMeta
     const responseData = {
-      ok: true,
-      data: {
-        companyScore,
-        scoredCount,
-        totalPromises: promises.length,
-        breakdown: companyScoreResult.breakdown,
-        promises: scoredPromises.map((p) => ({
-          text: p.text,
-          type: p.type,
-          timeHorizon: p.timeHorizon,
-          measurable: p.measurable,
-          confidence: p.confidence,
-          confidenceScore: p.confidenceScore,
-          score: p.score ? {
-            score0to100: p.score.score0to100,
-            status: p.score.status,
-            reasons: p.score.reasons,
-            scoredAt: p.score.scoredAt, // Redan ISO string
-          } : undefined,
-        })),
+      success: true,
+      companyScore,
+      scoredCount,
+      breakdown: companyScoreResult.breakdown,
+      promises: scoredPromises.slice(0, 50).map((p) => ({
+        text: p.text,
+        type: p.type,
+        timeHorizon: p.timeHorizon,
+        measurable: p.measurable,
+        confidence: p.confidence,
+        confidenceScore: p.confidenceScore,
+        score: p.score ? {
+          score0to100: p.score.score0to100,
+          status: p.score.status,
+          reasons: p.score.reasons,
+          scoredAt: p.score.scoredAt, // Redan ISO string
+        } : undefined,
+        verification: p.verification,
+      })),
+      debugMeta: {
+        ...debugMeta,
+        // Begränsa arrays till max 30 items
+        availableKpiKeysSample: debugMeta.availableKpiKeysSample?.slice(0, 30) || [],
+        selectedKpisUsed: debugMeta.selectedKpisUsed?.slice(0, 30) || [],
       },
     };
 
@@ -361,7 +399,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     return NextResponse.json(
       {
-        ok: false,
+        success: false,
         error: {
           code: "INTERNAL_ERROR",
           message: "Ett oväntat fel uppstod vid scoring",

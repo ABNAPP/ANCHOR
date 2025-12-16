@@ -37,6 +37,19 @@ export interface KpiExtractionResult {
   };
 }
 
+/**
+ * Normaliserad KPI-map för enklare verifiering.
+ * Grupperar olika KPI-keys under standardiserade kategorier.
+ */
+export interface NormalizedKpiMap {
+  REVENUE: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+  COGS: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+  OPEX: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+  CAPEX: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+  GROSS_PROFIT: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+  OPERATING_INCOME: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+}
+
 // ============================================
 // KPI DEFINITIONS
 // ============================================
@@ -419,7 +432,7 @@ export function extractKpisFromCompanyFacts(
   const uniqueMetrics = new Set(kpis.map(k => k.key)).size;
   const coverageYearsArray = Array.from(coveredYears).sort((a, b) => b - a);
 
-  return {
+  const result: KpiExtractionResult = {
     cik: factsJson.cik?.toString().padStart(10, "0") || "",
     companyName: factsJson.entityName || "",
     asOf: latestFiledDate || new Date().toISOString().split("T")[0],
@@ -431,6 +444,120 @@ export function extractKpisFromCompanyFacts(
       coverageYears: coverageYearsArray,
     },
   };
+
+  console.log(`[xbrl] Extracted KPI keys: ${Array.from(new Set(kpis.map(k => k.key))).join(", ")}`);
+  console.log(`[xbrl] Total KPI data points: ${kpis.length}`);
+
+  return result;
+}
+
+/**
+ * Normaliserad KPI-map för enklare verifiering.
+ * Grupperar olika KPI-keys under standardiserade kategorier.
+ */
+export interface NormalizedKpiMap {
+  REVENUE: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+  COGS: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+  OPEX: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+  CAPEX: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+  GROSS_PROFIT: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+  OPERATING_INCOME: { latest: ExtractedKpi | null; prev: ExtractedKpi | null };
+}
+
+/**
+ * Skapar en normaliserad KPI-map från extraherade KPIs.
+ * Grupperar olika KPI-keys under standardiserade kategorier och väljer senaste FY.
+ */
+export function createNormalizedKpiMap(kpiResult: KpiExtractionResult): NormalizedKpiMap {
+  const map: NormalizedKpiMap = {
+    REVENUE: { latest: null, prev: null },
+    COGS: { latest: null, prev: null },
+    OPEX: { latest: null, prev: null },
+    CAPEX: { latest: null, prev: null },
+    GROSS_PROFIT: { latest: null, prev: null },
+    OPERATING_INCOME: { latest: null, prev: null },
+  };
+
+  // Hjälpfunktion: hitta senaste FY och föregående FY för en KPI-key
+  function findLatestAndPrev(kpiKeys: string[]): { latest: ExtractedKpi | null; prev: ExtractedKpi | null } {
+    // Hitta alla KPIs som matchar någon av keys
+    const matchingKpis = kpiResult.kpis.filter(k => kpiKeys.includes(k.key));
+    
+    // Filtrera till endast annual (FY) data
+    const annualKpis = matchingKpis.filter(k => k.periodType === "annual");
+    
+    if (annualKpis.length === 0) {
+      // Om inga annual, försök med quarterly
+      const quarterlyKpis = matchingKpis.filter(k => k.periodType === "quarterly");
+      if (quarterlyKpis.length === 0) return { latest: null, prev: null };
+      
+      // Gruppera efter fiscal year och ta senaste Q4 per år
+      const byYear = new Map<number, ExtractedKpi[]>();
+      quarterlyKpis.forEach(k => {
+        if (!byYear.has(k.fiscalYear)) byYear.set(k.fiscalYear, []);
+        byYear.get(k.fiscalYear)!.push(k);
+      });
+      
+      const years = Array.from(byYear.keys()).sort((a, b) => b - a);
+      if (years.length === 0) return { latest: null, prev: null };
+      
+      const latestYear = years[0];
+      const latestYearKpis = byYear.get(latestYear)!;
+      const latest = latestYearKpis.find(k => k.fiscalPeriod === "Q4") || latestYearKpis[0];
+      
+      if (years.length > 1) {
+        const prevYear = years[1];
+        const prevYearKpis = byYear.get(prevYear)!;
+        const prev = prevYearKpis.find(k => k.fiscalPeriod === "Q4") || prevYearKpis[0];
+        return { latest, prev };
+      }
+      
+      return { latest, prev: null };
+    }
+    
+    // Gruppera efter fiscal year
+    const byYear = new Map<number, ExtractedKpi[]>();
+    annualKpis.forEach(k => {
+      if (!byYear.has(k.fiscalYear)) byYear.set(k.fiscalYear, []);
+      byYear.get(k.fiscalYear)!.push(k);
+    });
+    
+    const years = Array.from(byYear.keys()).sort((a, b) => b - a);
+    if (years.length === 0) return { latest: null, prev: null };
+    
+    const latestYear = years[0];
+    const latestYearKpis = byYear.get(latestYear)!;
+    const latest = latestYearKpis[0]; // Ta första (borde bara finnas en per år för FY)
+    
+    if (years.length > 1) {
+      const prevYear = years[1];
+      const prevYearKpis = byYear.get(prevYear)!;
+      const prev = prevYearKpis[0];
+      return { latest, prev };
+    }
+    
+    return { latest, prev: null };
+  }
+
+  // REVENUE: revenue, netSales
+  map.REVENUE = findLatestAndPrev(["revenue", "netSales"]);
+  
+  // COGS: cogs
+  map.COGS = findLatestAndPrev(["cogs"]);
+  
+  // OPEX: operatingExpenses
+  map.OPEX = findLatestAndPrev(["operatingExpenses"]);
+  
+  // CAPEX: capex
+  map.CAPEX = findLatestAndPrev(["capex"]);
+  
+  // GROSS_PROFIT: grossProfit
+  map.GROSS_PROFIT = findLatestAndPrev(["grossProfit"]);
+  
+  // OPERATING_INCOME: operatingIncome
+  map.OPERATING_INCOME = findLatestAndPrev(["operatingIncome"]);
+
+  return map;
 }
 
 /**
