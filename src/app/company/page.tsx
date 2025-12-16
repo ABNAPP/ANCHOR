@@ -10,6 +10,7 @@ import {
   type StandardPromise,
   type VerifyPromiseOptions 
 } from "@/lib/company/verification-service";
+import { computeCompanyScoreFromPromises } from "@/lib/company/company-score";
 
 // ============================================
 // TYPES
@@ -302,6 +303,13 @@ export default function CompanyPage() {
 
   // Scoring State
   const [companyScore, setCompanyScore] = useState<number | null>(null);
+  const [companyScoreBasis, setCompanyScoreBasis] = useState<{
+    nonUnclearCount: number;
+    held: number;
+    failed: number;
+    mixed: number;
+    unclear: number;
+  } | null>(null);
   const [scoringLoading, setScoringLoading] = useState(false);
 
   // ============================================
@@ -780,12 +788,22 @@ export default function CompanyPage() {
             }
             return p;
           });
+          
+          // Beräkna company score efter verifiering
+          const scoreResult = computeCompanyScoreFromPromises(updatedPromises);
+          
+          // Uppdatera companyScore state
+          setCompanyScore(scoreResult.companyScore);
+          setCompanyScoreBasis(scoreResult.basis);
+          
           return {
             ...prev,
             extraction: {
               ...prev.extraction,
               promises: updatedPromises,
             },
+            companyScore: scoreResult.companyScore,
+            companyScoreBasis: scoreResult.basis,
           };
         });
       }
@@ -852,16 +870,13 @@ export default function CompanyPage() {
       const summary = data.summary;
       console.log("[verify-all] Summary:", summary);
       
-      // Refetch dokumentet från Firestore för att få uppdaterade promises
-      if (extractResponse.firestoreId) {
-        try {
-          // Hämta uppdaterat dokument (via extract-promises endpoint eller direkt från Firestore)
-          // För nu: Uppdatera state med summary och visa meddelande
-          // TODO: Implementera refetch från Firestore om det behövs
-        } catch (refetchError) {
-          console.error("[verify-all] Failed to refetch:", refetchError);
-        }
+      // Uppdatera companyScore från response
+      if (data.companyScore !== undefined) {
+        setCompanyScore(data.companyScore);
       }
+
+      // Uppdatera extractResponse med nya verifications om de finns
+      // (för nu, behöver vi refetch från Firestore eller få promises tillbaka i response)
 
       // Visa success-meddelande med summary
       const summaryMsg = `Bulk-verifiering klar: ${summary.updated} uppdaterade, ${summary.skipped} hoppades över, ${summary.held} Held, ${summary.failed} Failed, ${summary.mixed} Mixed, ${summary.unclear} Unclear${summary.errors.length > 0 ? `, ${summary.errors.length} fel` : ''}`;
@@ -917,16 +932,13 @@ export default function CompanyPage() {
       const summary = data.summary;
       console.log("[verify-selected] Summary:", summary);
       
-      // Refetch dokumentet från Firestore för att få uppdaterade promises
-      if (extractResponse.firestoreId) {
-        try {
-          // Hämta uppdaterat dokument (via extract-promises endpoint eller direkt från Firestore)
-          // För nu: Uppdatera state med summary och visa meddelande
-          // TODO: Implementera refetch från Firestore om det behövs
-        } catch (refetchError) {
-          console.error("[verify-selected] Failed to refetch:", refetchError);
-        }
+      // Uppdatera companyScore från response
+      if (data.companyScore !== undefined) {
+        setCompanyScore(data.companyScore);
       }
+
+      // Uppdatera extractResponse med nya verifications om de finns
+      // (för nu, behöver vi refetch från Firestore eller få promises tillbaka i response)
 
       // Visa success-meddelande med summary
       const summaryMsg = `Bulk-verifiering klar: ${summary.updated} uppdaterade, ${summary.skipped} hoppades över, ${summary.held} Held, ${summary.failed} Failed, ${summary.mixed} Mixed, ${summary.unclear} Unclear${summary.errors.length > 0 ? `, ${summary.errors.length} fel` : ''}`;
@@ -1318,6 +1330,9 @@ export default function CompanyPage() {
       if (data.success === true) {
         console.log("[score] Success:", data);
         setCompanyScore(data.companyScore ?? null);
+        if (data.companyScoreBasis) {
+          setCompanyScoreBasis(data.companyScoreBasis);
+        }
         
         // Uppdatera promises med scores från response
         if (data.promises && Array.isArray(data.promises)) {
@@ -1726,6 +1741,15 @@ export default function CompanyPage() {
                           {companyScore.toFixed(0)}
                         </div>
                         <div style={styles.statLabel}>Company Score</div>
+                        {companyScoreBasis && companyScoreBasis.nonUnclearCount > 0 && (
+                          <div style={{
+                            fontSize: "0.625rem",
+                            color: "var(--text-secondary)",
+                            marginTop: "0.125rem",
+                          }}>
+                            {companyScoreBasis.held}H/{companyScoreBasis.failed}F/{companyScoreBasis.mixed}M
+                          </div>
+                        )}
                       </div>
                     )}
                     <div style={styles.statCard}>
@@ -1758,6 +1782,17 @@ export default function CompanyPage() {
                           {companyScore !== null ? companyScore.toFixed(0) : "N/A"}
                         </div>
                         <div style={styles.scoreSummaryLabel}>Company Score</div>
+                        {companyScoreBasis && companyScoreBasis.nonUnclearCount > 0 && (
+                          <div style={{
+                            fontSize: "0.75rem",
+                            color: "var(--text-secondary)",
+                            marginTop: "0.25rem",
+                          }}>
+                            Held: {companyScoreBasis.held}, Failed: {companyScoreBasis.failed}, Mixed: {companyScoreBasis.mixed}
+                            <br />
+                            (beräknad på {companyScoreBasis.nonUnclearCount} verifierade promises)
+                          </div>
+                        )}
                       </div>
                       
                       <div style={styles.scoreSummaryCard}>

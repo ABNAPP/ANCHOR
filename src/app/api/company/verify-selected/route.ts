@@ -11,6 +11,7 @@ import { extractKpisFromCompanyFacts } from "@/lib/company/kpis";
 import { bulkVerifyPromises } from "@/lib/company/bulk-verification";
 import { sanitizePromisesForFirestore, sanitizeForFirestore } from "@/lib/firebase/sanitize";
 import { FieldValue } from "firebase-admin/firestore";
+import { computeCompanyScoreFromPromises } from "@/lib/company/company-score";
 
 interface VerifySelectedRequest {
   promiseDocId: string;
@@ -179,11 +180,18 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return promise;
     });
 
-    // 8. Spara tillbaka till Firestore
+    // 8. Beräkna company score baserat på verifierade promises
+    const companyScoreResult = computeCompanyScoreFromPromises(updatedPromises);
+    console.log(`[verify-selected] Company score: ${companyScoreResult.companyScore}, basis:`, companyScoreResult.basis);
+
+    // 9. Spara tillbaka till Firestore
     try {
       const sanitizedPromises = sanitizePromisesForFirestore(updatedPromises);
       const updateData = sanitizeForFirestore({
         promises: sanitizedPromises,
+        companyScore: companyScoreResult.companyScore,
+        companyScoreUpdatedAt: new Date().toISOString(),
+        companyScoreBasis: companyScoreResult.basis,
         bulkVerifiedAt: FieldValue.serverTimestamp(),
       });
 
@@ -194,10 +202,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       // Fortsätt ändå - vi returnerar summary
     }
 
-    // 9. Returnera summary
+    // 10. Returnera summary
     return NextResponse.json({
       success: true,
       summary,
+      companyScore: companyScoreResult.companyScore,
+      companyScoreBasis: companyScoreResult.basis,
     });
 
   } catch (error) {
