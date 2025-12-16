@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { PortalStyleFix } from "./portal-style-fix";
 
 export const metadata: Metadata = {
   title: "Macro Relationship Engine | MVP",
@@ -19,7 +20,10 @@ export default function RootLayout({
           rel="stylesheet"
         />
       </head>
-      <body>{children}</body>
+      <body>
+        <PortalStyleFix />
+        {children}
+      </body>
     </html>
   );
 }

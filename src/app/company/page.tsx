@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import Link from "next/link";
+import { DebugOverlay, DebugError as DebugErrorType } from "@/components/DebugOverlay";
 
 // ============================================
 // TYPES
@@ -29,12 +30,28 @@ interface FilingsData {
   filings: Filing[];
 }
 
+type PromiseType =
+  | "REVENUE"
+  | "MARGIN"
+  | "COSTS"
+  | "CAPEX"
+  | "DEBT"
+  | "STRATEGY"
+  | "PRODUCT"
+  | "MARKET"
+  | "OTHER";
+
+type TimeHorizon = "NEXT_Q" | "FY1" | "FY2PLUS" | "LONG_TERM" | "UNSPECIFIED";
+
 interface ExtractedPromise {
   text: string;
-  category: string;
+  type: PromiseType;
+  timeHorizon: TimeHorizon;
+  measurable: boolean;
   confidence: "high" | "medium" | "low";
-  source: string;
+  confidenceScore: number;
   keywords: string[];
+  source: string;
 }
 
 interface ExtractionResult {
@@ -42,12 +59,163 @@ interface ExtractionResult {
   extractedCount: number;
   promises: ExtractedPromise[];
   summary: {
-    byCategory: Record<string, number>;
+    byType: Record<PromiseType, number>;
+    byTimeHorizon: Record<TimeHorizon, number>;
     byConfidence: Record<string, number>;
+    measurableCount: number;
+  };
+}
+
+interface ExtractResponse {
+  cik: string;
+  accessionNumber: string;
+  formType: string;
+  companyName: string | null;
+  ticker: string | null;
+  documentUsed: string;
+  usedFallback: boolean;
+  textSource: string;
+  textLength: number;
+  extraction: ExtractionResult;
+  savedToFirestore: boolean;
+  firestoreId?: string;
+}
+
+// KPI Types
+interface ExtractedKpi {
+  key: string;
+  label: string;
+  period: string;
+  periodType: "annual" | "quarterly" | "instant";
+  value: number;
+  unit: string;
+  filedDate: string;
+  fiscalYear: number;
+  fiscalPeriod: string;
+  form: string;
+}
+
+interface KpiResponse {
+  cik: string;
+  companyName: string;
+  asOf: string;
+  kpis: ExtractedKpi[];
+  summary: {
+    totalKpis: number;
+    uniqueMetrics: number;
+    latestFilingDate: string;
+    coverageYears: number[];
+  };
+}
+
+// Verification Types
+type VerificationStatus = "SUPPORTED" | "CONTRADICTED" | "UNRESOLVED" | "PENDING";
+
+interface KpiComparison {
+  before: { period: string; value: number; unit: string; filedDate: string } | null;
+  after: { period: string; value: number; unit: string; filedDate: string } | null;
+  deltaAbs: number | null;
+  deltaPct: number | null;
+}
+
+interface VerificationResult {
+  status: VerificationStatus;
+  confidence: "high" | "medium" | "low";
+  kpiUsed: { key: string; label: string } | null;
+  comparison: KpiComparison;
+  notes: string;
+  reasoning: string[];
+}
+
+interface VerificationResponse {
+  success: boolean;
+  verificationId?: string;
+  savedToFirestore: boolean;
+  verification: VerificationResult;
+  kpiSummary: {
+    totalKpis: number;
+    uniqueMetrics: number;
+    coverageYears: number[];
+    asOf: string;
   };
 }
 
 type Step = "search" | "filings" | "extract" | "results";
+type ActiveTab = "promises" | "kpis";
+
+// ============================================
+// CONSTANTS
+// ============================================
+
+const SUPPORTED_FORMS = ["10-K", "10-Q"];
+
+// Promise types som kan verifieras mot KPI
+const VERIFIABLE_TYPES: PromiseType[] = ["REVENUE", "MARGIN", "COSTS", "CAPEX", "DEBT", "PRODUCT", "MARKET"];
+
+const TYPE_LABELS: Record<PromiseType, string> = {
+  REVENUE: "Revenue",
+  MARGIN: "Margin",
+  COSTS: "Costs",
+  CAPEX: "CapEx",
+  DEBT: "Debt",
+  STRATEGY: "Strategy",
+  PRODUCT: "Product",
+  MARKET: "Market",
+  OTHER: "Other",
+};
+
+const TIME_LABELS: Record<TimeHorizon, string> = {
+  NEXT_Q: "Next Quarter",
+  FY1: "This Year",
+  FY2PLUS: "2+ Years",
+  LONG_TERM: "Long-term",
+  UNSPECIFIED: "Unspecified",
+};
+
+const STATUS_CONFIG: Record<VerificationStatus, { label: string; emoji: string; color: string }> = {
+  SUPPORTED: { label: "Stöds", emoji: "✅", color: "var(--accent-green)" },
+  CONTRADICTED: { label: "Motsägs", emoji: "❌", color: "var(--accent-red)" },
+  UNRESOLVED: { label: "Oklar", emoji: "❓", color: "var(--accent-orange)" },
+  PENDING: { label: "Väntar", emoji: "⏳", color: "var(--text-muted)" },
+};
+
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+
+function isSupportedForm(form: string): boolean {
+  const upper = form.toUpperCase();
+  return SUPPORTED_FORMS.some((f) => upper.includes(f));
+}
+
+function isVerifiableType(type: PromiseType): boolean {
+  return VERIFIABLE_TYPES.includes(type);
+}
+
+function formatKpiValue(value: number, unit: string): string {
+  if (unit === "shares") {
+    if (value >= 1_000_000_000) {
+      return `${(value / 1_000_000_000).toFixed(2)}B`;
+    }
+    if (value >= 1_000_000) {
+      return `${(value / 1_000_000).toFixed(1)}M`;
+    }
+    return value.toLocaleString();
+  }
+  
+  if (unit === "USD/share") {
+    return `$${value.toFixed(2)}`;
+  }
+  
+  // USD
+  if (Math.abs(value) >= 1_000_000_000) {
+    return `$${(value / 1_000_000_000).toFixed(2)}B`;
+  }
+  if (Math.abs(value) >= 1_000_000) {
+    return `$${(value / 1_000_000).toFixed(1)}M`;
+  }
+  return `$${value.toLocaleString()}`;
+}
 
 // ============================================
 // COMPONENT
@@ -58,6 +226,10 @@ export default function CompanyPage() {
   const [step, setStep] = useState<Step>("search");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  
+  // Debug error state
+  const [debugErrors, setDebugErrors] = useState<DebugErrorType[]>([]);
+  const [debugVisible, setDebugVisible] = useState(true);
 
   // Search
   const [searchQuery, setSearchQuery] = useState("");
@@ -71,8 +243,96 @@ export default function CompanyPage() {
   const [selectedFiling, setSelectedFiling] = useState<Filing | null>(null);
 
   // Extraction results
-  const [extraction, setExtraction] = useState<ExtractionResult | null>(null);
-  const [savedToFirestore, setSavedToFirestore] = useState(false);
+  const [extractResponse, setExtractResponse] = useState<ExtractResponse | null>(null);
+  
+  // Filter state for results
+  const [typeFilter, setTypeFilter] = useState<PromiseType | "ALL">("ALL");
+  const [confidenceFilter, setConfidenceFilter] = useState<"high" | "medium" | "low" | "ALL">("ALL");
+
+  // KPI State
+  const [kpiResponse, setKpiResponse] = useState<KpiResponse | null>(null);
+  const [kpiLoading, setKpiLoading] = useState(false);
+  const [kpiError, setKpiError] = useState<string | null>(null);
+  const [kpiFilter, setKpiFilter] = useState<string>("ALL");
+  const [activeTab, setActiveTab] = useState<ActiveTab>("promises");
+
+  // Verification State
+  const [verificationResults, setVerificationResults] = useState<Map<number, VerificationResult>>(new Map());
+  const [verifyingIndices, setVerifyingIndices] = useState<Set<number>>(new Set());
+  const [selectedVerification, setSelectedVerification] = useState<{ index: number; result: VerificationResult } | null>(null);
+  const [selectedPromiseIndices, setSelectedPromiseIndices] = useState<Set<number>>(new Set());
+  const [batchVerifying, setBatchVerifying] = useState(false);
+
+  // ============================================
+  // DERIVED STATE
+  // ============================================
+
+  const supportedFilings = useMemo(() => {
+    if (!filingsData?.filings) return [];
+    return filingsData.filings.filter((f) => f && isSupportedForm(f.form));
+  }, [filingsData]);
+
+  const filteredPromises = useMemo(() => {
+    if (!extractResponse?.extraction?.promises) return [];
+    let promises = extractResponse.extraction.promises;
+
+    if (typeFilter !== "ALL") {
+      promises = promises.filter((p) => p?.type === typeFilter);
+    }
+
+    if (confidenceFilter !== "ALL") {
+      promises = promises.filter((p) => p?.confidence === confidenceFilter);
+    }
+
+    return promises;
+  }, [extractResponse, typeFilter, confidenceFilter]);
+
+  const filteredKpis = useMemo(() => {
+    if (!kpiResponse?.kpis) return [];
+    if (kpiFilter === "ALL") return kpiResponse.kpis;
+    return kpiResponse.kpis.filter((k) => k?.key === kpiFilter);
+  }, [kpiResponse, kpiFilter]);
+
+  const uniqueKpiKeys = useMemo(() => {
+    if (!kpiResponse?.kpis) return [];
+    const keys = new Set(kpiResponse.kpis.map((k) => k?.key).filter(Boolean));
+    return Array.from(keys).sort();
+  }, [kpiResponse]);
+
+  // ============================================
+  // DEBUG HELPERS
+  // ============================================
+
+  const addDebugError = useCallback((context: string, err: unknown, status?: number, details?: string) => {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    const errorDetails = details || (err instanceof Error && err.stack ? err.stack.split('\n').slice(0, 5).join('\n') : undefined);
+    
+    const newError: DebugErrorType = {
+      at: new Date().toISOString(),
+      context,
+      message: errorMessage,
+      status,
+      details: errorDetails,
+    };
+    
+    setDebugErrors((prev) => {
+      const updated = [newError, ...prev].slice(0, 10); // Keep last 10
+      return updated;
+    });
+    
+    // Show overlay when new error is added
+    setDebugVisible(true);
+    
+    console.error(`[${context}]`, err);
+  }, []);
+
+  const clearDebugErrors = useCallback(() => {
+    setDebugErrors([]);
+  }, []);
+
+  const closeDebugOverlay = useCallback(() => {
+    setDebugVisible(false);
+  }, []);
 
   // ============================================
   // HANDLERS
@@ -89,50 +349,88 @@ export default function CompanyPage() {
       const res = await fetch(`/api/company/search?q=${encodeURIComponent(searchQuery)}`);
       const data = await res.json();
 
-      if (!res.ok) {
-        throw new Error(data.message || "Sökningen misslyckades");
+      if (!res.ok || data.ok === false) {
+        const errorMsg = data.error?.message || data.message || "Sökningen misslyckades";
+        const errorDetails = data.error?.details ? JSON.stringify(data.error.details, null, 2) : undefined;
+        addDebugError("search", new Error(errorMsg), res.status, errorDetails);
+        throw new Error(errorMsg);
       }
 
-      setSearchResults(data.results || []);
+      // Handle normalized response format
+      const results = data.data?.results || data.results || [];
+      setSearchResults(Array.isArray(results) ? results : []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Ett fel uppstod");
+      const errorMsg = err instanceof Error ? err.message : "Ett fel uppstod";
+      setError(errorMsg);
+      if (!(err instanceof Error && err.message)) {
+        addDebugError("search", err);
+      }
     } finally {
       setLoading(false);
     }
-  }, [searchQuery]);
+  }, [searchQuery, addDebugError]);
 
   const handleSelectCompany = useCallback(async (company: SearchResult) => {
     setSelectedCompany(company);
     setLoading(true);
     setError(null);
+    setKpiResponse(null);
+    setKpiError(null);
+    setVerificationResults(new Map());
 
     try {
       const res = await fetch(`/api/company/filings?cik=${company.cik}`);
-      const data = await res.json();
+      const data = await res.json().catch(() => ({ ok: false, error: { message: "Failed to parse JSON response" } }));
 
-      if (!res.ok) {
-        throw new Error(data.message || "Kunde inte hämta filings");
+      if (!res.ok || data.ok === false) {
+        const errorMsg = data.error?.message || data.message || "Kunde inte hämta filings";
+        const errorDetails = data.error?.details ? JSON.stringify(data.error.details, null, 2) : undefined;
+        addDebugError("filings", new Error(errorMsg), res.status, errorDetails);
+        throw new Error(errorMsg);
       }
 
-      setFilingsData(data);
+      // Handle normalized response format
+      const responseData = data.data || data;
+      
+      // Validate response structure
+      if (!responseData || typeof responseData !== 'object' || !responseData.filings) {
+        throw new Error("Ogiltigt svar från API");
+      }
+
+      setFilingsData(responseData);
       setStep("filings");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Ett fel uppstod");
+      const errorMsg = err instanceof Error ? err.message : "Ett fel uppstod";
+      setError(errorMsg);
+      if (!(err instanceof Error && err.message)) {
+        addDebugError("filings", err);
+      }
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [addDebugError]);
 
   const handleSelectFiling = useCallback((filing: Filing) => {
+    if (!isSupportedForm(filing.form)) {
+      setError("Endast 10-K och 10-Q stöds för promise extraction.");
+      return;
+    }
     setSelectedFiling(filing);
+    setError(null);
     setStep("extract");
   }, []);
 
   const handleExtractPromises = useCallback(async () => {
     if (!selectedCompany || !selectedFiling) return;
 
+    if (!isSupportedForm(selectedFiling.form)) {
+      setError("Endast 10-K och 10-Q stöds för promise extraction.");
+      return;
+    }
+
     setLoading(true);
     setError(null);
+    setVerificationResults(new Map());
 
     try {
       const res = await fetch("/api/company/extract-promises", {
@@ -148,21 +446,302 @@ export default function CompanyPage() {
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({ ok: false, error: { message: "Failed to parse JSON response" } }));
 
-      if (!res.ok) {
-        throw new Error(data.message || "Extraction misslyckades");
+      if (!res.ok || data.ok === false) {
+        const errorMsg = data.error?.message || data.message || data.suggestion || "Extraction misslyckades";
+        const errorDetails = data.error?.details ? JSON.stringify(data.error.details, null, 2) : data.suggestion;
+        addDebugError("extract", new Error(errorMsg), res.status, errorDetails);
+        throw new Error(errorMsg);
       }
 
-      setExtraction(data.extraction);
-      setSavedToFirestore(data.savedToFirestore);
+      // Handle normalized response format
+      const responseData = data.data || data;
+
+      // Validate response structure
+      if (!responseData || !responseData.extraction || !Array.isArray(responseData.extraction.promises)) {
+        throw new Error("Ogiltigt svar från extraction API");
+      }
+
+      setExtractResponse(responseData);
+      setTypeFilter("ALL");
+      setConfidenceFilter("ALL");
+      setActiveTab("promises");
       setStep("results");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Ett fel uppstod");
+      const errorMsg = err instanceof Error ? err.message : "Ett fel uppstod";
+      setError(errorMsg);
+      if (!(err instanceof Error && err.message)) {
+        addDebugError("extract", err);
+      }
     } finally {
       setLoading(false);
     }
-  }, [selectedCompany, selectedFiling, filingsData]);
+  }, [selectedCompany, selectedFiling, filingsData, addDebugError]);
+
+  const handleFetchKpis = useCallback(async () => {
+    if (!selectedCompany) return;
+
+    setKpiLoading(true);
+    setKpiError(null);
+
+    try {
+      const res = await fetch(`/api/company/facts?cik=${selectedCompany.cik}`);
+      const data = await res.json().catch(() => ({ ok: false, error: { message: "Failed to parse JSON response" } }));
+
+      if (!res.ok || data.ok === false) {
+        const errorMsg = data.error?.message || data.message || "Kunde inte hämta KPI:er";
+        const errorDetails = data.error?.details ? JSON.stringify(data.error.details, null, 2) : undefined;
+        addDebugError("facts", new Error(errorMsg), res.status, errorDetails);
+        throw new Error(errorMsg);
+      }
+
+      // Handle normalized response format
+      const responseData = data.data || data;
+
+      // Validate response structure
+      if (!responseData || !Array.isArray(responseData.kpis)) {
+        throw new Error("Ogiltigt svar från KPI API");
+      }
+
+      setKpiResponse(responseData);
+      setKpiFilter("ALL");
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : "Ett fel uppstod";
+      setKpiError(errorMsg);
+      if (!(err instanceof Error && err.message)) {
+        addDebugError("facts", err);
+      }
+    } finally {
+      setKpiLoading(false);
+    }
+  }, [selectedCompany, addDebugError]);
+
+  const handleVerifyPromise = useCallback(async (promiseIndex: number, promise: ExtractedPromise) => {
+    if (!selectedCompany || !selectedFiling || !extractResponse) return;
+
+    // Validate promiseIndex is within bounds
+    if (promiseIndex < 0 || promiseIndex >= (extractResponse.extraction.promises?.length || 0)) {
+      addDebugError("verify", new Error(`Invalid promiseIndex: ${promiseIndex}`));
+      return;
+    }
+
+    // Markera som verifierar
+    setVerifyingIndices((prev) => new Set(prev).add(promiseIndex));
+
+    try {
+      const res = await fetch("/api/company/verify-promise", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cik10: selectedCompany.cik,
+          companyName: filingsData?.companyName || extractResponse.companyName,
+          ticker: selectedCompany.ticker,
+          filingAccession: selectedFiling.accessionNumber,
+          filingDate: selectedFiling.filingDate,
+          promiseIndex,
+          promise: {
+            text: promise.text,
+            type: promise.type,
+            timeHorizon: promise.timeHorizon,
+            measurable: promise.measurable,
+            confidence: promise.confidence,
+          },
+        }),
+      });
+
+      const data = await res.json().catch(() => ({ ok: false, error: { message: "Failed to parse JSON response" } }));
+
+      // Handle normalized response format
+      if (!res.ok || (data.ok === false)) {
+        const errorMsg = data.error?.message || data.message || "Verifiering misslyckades";
+        const errorDetails = data.error?.details ? JSON.stringify(data.error.details, null, 2) : undefined;
+        addDebugError("verify", new Error(errorMsg), res.status, errorDetails);
+        
+        // Set error result
+        setVerificationResults((prev) => {
+          const newMap = new Map(prev);
+          newMap.set(promiseIndex, {
+            status: "UNRESOLVED",
+            confidence: "low",
+            kpiUsed: null,
+            comparison: { before: null, after: null, deltaAbs: null, deltaPct: null },
+            notes: errorMsg,
+            reasoning: ["Ett fel uppstod vid verifieringen"],
+          });
+          return newMap;
+        });
+        return;
+      }
+
+      // Handle success response (normalized format: data.ok === true || old format)
+      const verification = data.data?.verification || data.verification;
+      if (!verification) {
+        throw new Error("Saknar verification data i response");
+      }
+
+      // Validate verification structure
+      if (!verification.status || !verification.confidence) {
+        throw new Error("Ogiltig verification struktur");
+      }
+
+      // Spara resultat
+      setVerificationResults((prev) => {
+        const newMap = new Map(prev);
+        newMap.set(promiseIndex, verification);
+        return newMap;
+      });
+    } catch (err) {
+      addDebugError("verify", err);
+      // Lägg till ett felsvar
+      setVerificationResults((prev) => {
+        const newMap = new Map(prev);
+        newMap.set(promiseIndex, {
+          status: "UNRESOLVED",
+          confidence: "low",
+          kpiUsed: null,
+          comparison: { before: null, after: null, deltaAbs: null, deltaPct: null },
+          notes: err instanceof Error ? err.message : "Verifiering misslyckades",
+          reasoning: ["Ett fel uppstod vid verifieringen"],
+        });
+        return newMap;
+      });
+    } finally {
+      setVerifyingIndices((prev) => {
+        const newSet = new Set(prev);
+        newSet.delete(promiseIndex);
+        return newSet;
+      });
+    }
+  }, [selectedCompany, selectedFiling, filingsData, extractResponse, addDebugError]);
+
+  const handleBatchVerify = useCallback(async (promiseIndexes?: number[]) => {
+    if (!selectedCompany || !selectedFiling || !extractResponse) return;
+
+    const promises = extractResponse.extraction.promises || [];
+    if (promises.length === 0) return;
+
+    // Bestäm vilka promises som ska verifieras
+    let indexesToVerify: number[];
+    if (promiseIndexes && promiseIndexes.length > 0) {
+      // Verifiera valda promises
+      indexesToVerify = promiseIndexes.filter((idx) => 
+        idx >= 0 && idx < promises.length && isVerifiableType(promises[idx].type)
+      );
+    } else {
+      // Verifiera alla verifierbara promises
+      indexesToVerify = promises
+        .map((p, idx) => ({ idx, promise: p }))
+        .filter(({ promise }) => isVerifiableType(promise.type))
+        .map(({ idx }) => idx);
+    }
+
+    if (indexesToVerify.length === 0) {
+      addDebugError("verify", new Error("Inga verifierbara promises att verifiera"));
+      return;
+    }
+
+    // Markera som verifierar
+    setBatchVerifying(true);
+    setVerifyingIndices((prev) => {
+      const newSet = new Set(prev);
+      indexesToVerify.forEach((idx) => newSet.add(idx));
+      return newSet;
+    });
+
+    try {
+      const res = await fetch("/api/company/verify-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cik10: selectedCompany.cik,
+          companyName: filingsData?.companyName || extractResponse.companyName,
+          ticker: selectedCompany.ticker,
+          filingAccession: selectedFiling.accessionNumber,
+          filingDate: selectedFiling.filingDate,
+          promiseDocId: extractResponse.firestoreId || `temp-${selectedFiling.accessionNumber}`,
+          promiseIndexes: indexesToVerify,
+          promises: promises.map((p) => ({
+            text: p.text,
+            type: p.type,
+            timeHorizon: p.timeHorizon,
+            measurable: p.measurable,
+            confidence: p.confidence,
+          })),
+        }),
+      });
+
+      const data = await res.json().catch(() => ({ ok: false, error: { message: "Failed to parse JSON response" } }));
+
+      // Handle normalized response format
+      if (!res.ok || !data.ok) {
+        const errorMsg = data.error?.message || data.message || "Batch verifiering misslyckades";
+        addDebugError("verify", new Error(errorMsg), res.status);
+        return;
+      }
+
+      // Handle success response
+      const results = data.data?.results || [];
+      if (!Array.isArray(results)) {
+        throw new Error("Ogiltigt svar från batch verify API");
+      }
+
+      // Uppdatera verification results
+      setVerificationResults((prev) => {
+        const newMap = new Map(prev);
+        results.forEach((result: any) => {
+          if (result.promiseIndex !== undefined && result.status) {
+            newMap.set(result.promiseIndex, {
+              status: result.status,
+              confidence: result.confidence,
+              kpiUsed: result.kpiUsed,
+              comparison: result.comparison,
+              notes: result.notes,
+              reasoning: result.reasoning || [],
+            });
+          }
+        });
+        return newMap;
+      });
+
+      // Rensa valda promises
+      setSelectedPromiseIndices(new Set());
+    } catch (err) {
+      addDebugError("verify", err);
+    } finally {
+      setBatchVerifying(false);
+      setVerifyingIndices((prev) => {
+        const newSet = new Set(prev);
+        indexesToVerify.forEach((idx) => newSet.delete(idx));
+        return newSet;
+      });
+    }
+  }, [selectedCompany, selectedFiling, filingsData, extractResponse, addDebugError]);
+
+  const handleTogglePromiseSelection = useCallback((index: number) => {
+    setSelectedPromiseIndices((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(index)) {
+        newSet.delete(index);
+      } else {
+        newSet.add(index);
+      }
+      return newSet;
+    });
+  }, []);
+
+  const handleSelectAllVerifiable = useCallback(() => {
+    if (!extractResponse?.extraction?.promises) return;
+    const verifiableIndices = extractResponse.extraction.promises
+      .map((p, idx) => ({ idx, promise: p }))
+      .filter(({ promise }) => isVerifiableType(promise.type))
+      .map(({ idx }) => idx);
+    setSelectedPromiseIndices(new Set(verifiableIndices));
+  }, [extractResponse]);
+
+  const handleDeselectAll = useCallback(() => {
+    setSelectedPromiseIndices(new Set());
+  }, []);
 
   const handleReset = useCallback(() => {
     setStep("search");
@@ -171,9 +750,19 @@ export default function CompanyPage() {
     setSelectedCompany(null);
     setFilingsData(null);
     setSelectedFiling(null);
-    setExtraction(null);
-    setSavedToFirestore(false);
+    setExtractResponse(null);
+    setTypeFilter("ALL");
+    setConfidenceFilter("ALL");
+    setKpiResponse(null);
+    setKpiError(null);
+    setKpiFilter("ALL");
+    setActiveTab("promises");
     setError(null);
+    setVerificationResults(new Map());
+    setVerifyingIndices(new Set());
+    setSelectedVerification(null);
+    setSelectedPromiseIndices(new Set());
+    setBatchVerifying(false);
   }, []);
 
   // ============================================
@@ -189,7 +778,7 @@ export default function CompanyPage() {
     }
   };
 
-  const getConfidenceEmoji = (conf: string) => {
+  const getConfidenceBadge = (conf: string) => {
     switch (conf) {
       case "high": return "🟢";
       case "medium": return "🟡";
@@ -198,19 +787,25 @@ export default function CompanyPage() {
     }
   };
 
+  const getTypeColor = (type: PromiseType) => {
+    const colors: Record<PromiseType, string> = {
+      REVENUE: "#22c55e",
+      MARGIN: "#3b82f6",
+      COSTS: "#f97316",
+      CAPEX: "#8b5cf6",
+      DEBT: "#ef4444",
+      STRATEGY: "#06b6d4",
+      PRODUCT: "#ec4899",
+      MARKET: "#eab308",
+      OTHER: "#6b7280",
+    };
+    return colors[type];
+  };
+
   const formatFileSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  };
-
-  // Kontrollera om filing är en 8-K (som ofta saknar analysbart innehåll)
-  const is8KFiling = (form: string) => form.toUpperCase().includes("8-K");
-
-  // Kontrollera om form type stöds för promise extraction
-  const isSupportedForExtraction = (form: string) => {
-    const upper = form.toUpperCase();
-    return upper.includes("10-K") || upper.includes("10-Q");
   };
 
   // ============================================
@@ -220,6 +815,14 @@ export default function CompanyPage() {
   return (
     <main style={styles.main}>
       <div style={styles.container}>
+        {/* Debug Overlay */}
+        <DebugOverlay
+          errors={debugErrors}
+          visible={debugVisible}
+          onClear={clearDebugErrors}
+          onClose={closeDebugOverlay}
+        />
+        
         {/* Header */}
         <header style={styles.header}>
           <Link href="/" style={styles.backLink}>← Tillbaka till Macro</Link>
@@ -227,10 +830,11 @@ export default function CompanyPage() {
             <h1 style={styles.title}>
               <span style={styles.titleAccent}>◆</span> Company Engine
             </h1>
-            <span style={styles.badge}>SEC EDGAR</span>
+            <span style={styles.badge}>V2</span>
+            <span style={styles.badgeVerify}>+Verify</span>
           </div>
           <p style={styles.subtitle}>
-            Sök bolag → Välj filing → Extrahera promises/claims
+            Sök bolag → Välj 10-K/10-Q → Extrahera promises → Verifiera mot KPI
           </p>
         </header>
 
@@ -241,7 +845,7 @@ export default function CompanyPage() {
           </div>
           <div style={styles.progressArrow}>→</div>
           <div style={{...styles.progressStep, ...(step === "filings" ? styles.progressStepActive : {})}}>
-            2. Filings
+            2. Filing
           </div>
           <div style={styles.progressArrow}>→</div>
           <div style={{...styles.progressStep, ...(step === "extract" ? styles.progressStepActive : {})}}>
@@ -271,7 +875,7 @@ export default function CompanyPage() {
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-                placeholder="Ange ticker (t.ex. AAPL) eller bolagsnamn..."
+                placeholder="Ange ticker (t.ex. AAPL, MSFT) eller bolagsnamn..."
                 style={styles.input}
               />
               <button
@@ -306,52 +910,94 @@ export default function CompanyPage() {
         {step === "filings" && filingsData && (
           <section style={styles.section}>
             <div style={styles.companyHeader}>
-              <h2 style={styles.companyName}>{filingsData.companyName}</h2>
+              <h2 style={styles.companyName}>{filingsData?.companyName ?? "Okänt bolag"}</h2>
               <div style={styles.companyTickers}>
-                {filingsData.tickers.map((t) => (
+                {filingsData?.tickers?.map((t) => (
                   <span key={t} style={styles.tickerBadge}>{t}</span>
                 ))}
               </div>
             </div>
 
-            <h3 style={styles.sectionTitle}>Välj filing att analysera</h3>
-            
-            {/* Info om 8-K */}
-            <div style={styles.formTypeInfo}>
-              <p style={styles.formTypeHint}>
-                💡 <strong>Tips:</strong> Välj <span style={styles.highlightGreen}>10-K</span> (årsredovisning) eller{" "}
-                <span style={styles.highlightGreen}>10-Q</span> (kvartalsrapport) för bästa resultat.{" "}
-                <span style={styles.highlightOrange}>8-K</span> innehåller ofta endast pressmeddelanden/exhibits.
+            {/* KPI Section */}
+            <div style={styles.kpiSection}>
+              <h3 style={styles.sectionTitle}>📊 KPI (XBRL Data)</h3>
+              <p style={styles.kpiDescription}>
+                Hämta numeriska KPI:er direkt från SEC XBRL Company Facts.
               </p>
+              <button
+                onClick={handleFetchKpis}
+                disabled={kpiLoading}
+                style={{
+                  ...styles.button,
+                  ...styles.buttonKpi,
+                  ...(kpiLoading ? styles.buttonDisabled : {}),
+                }}
+              >
+                {kpiLoading ? "Hämtar..." : "📈 Hämta KPI (XBRL)"}
+              </button>
+
+              {kpiError && (
+                <div style={styles.kpiErrorBox}>
+                  <span>⚠</span> {kpiError}
+                </div>
+              )}
+
+              {kpiResponse && (
+                <div style={styles.kpiResults}>
+                  <div style={styles.kpiSummary}>
+                    <span>✓ {kpiResponse?.summary?.totalKpis ?? 0} KPIs</span>
+                    <span>|</span>
+                    <span>{kpiResponse?.summary?.uniqueMetrics ?? 0} metrics</span>
+                    <span>|</span>
+                    <span>År: {kpiResponse?.summary?.coverageYears?.slice(0, 3).join(", ") ?? "N/A"}</span>
+                  </div>
+                </div>
+              )}
             </div>
 
-            <div style={styles.filingsGrid}>
-              {filingsData.filings.slice(0, 20).map((filing) => {
-                const is8K = is8KFiling(filing.form);
-                return (
+            <hr style={styles.divider} />
+
+            <h3 style={styles.sectionTitle}>📄 Välj 10-K eller 10-Q för Promise Extraction</h3>
+            
+            <div style={styles.infoBox}>
+              <span style={styles.infoIcon}>💡</span>
+              <span>
+                Endast <strong>10-K</strong> (årsredovisning) och <strong>10-Q</strong> (kvartalsrapport) 
+                visas. Dessa innehåller MD&A med framåtblickande uttalanden.
+              </span>
+            </div>
+
+            {supportedFilings.length === 0 ? (
+              <div style={styles.emptyState}>
+                <p>Inga 10-K eller 10-Q filings hittades för detta bolag.</p>
+              </div>
+            ) : (
+              <div style={styles.filingsGrid}>
+                {supportedFilings.slice(0, 20).map((filing) => (
                   <div
                     key={filing.accessionNumber}
                     style={{
                       ...styles.filingCard,
-                      ...(is8K ? styles.filingCard8K : {}),
+                      borderColor: filing.form.includes("10-K") 
+                        ? "var(--accent-blue)" 
+                        : "var(--accent-purple)",
                     }}
                     onClick={() => handleSelectFiling(filing)}
                   >
                     <div style={{
                       ...styles.filingForm,
-                      color: is8K ? "var(--accent-orange)" : "var(--accent-blue)",
+                      color: filing.form.includes("10-K") 
+                        ? "var(--accent-blue)" 
+                        : "var(--accent-purple)",
                     }}>
                       {filing.form}
                     </div>
                     <div style={styles.filingDate}>{filing.filingDate}</div>
                     <div style={styles.filingSize}>{formatFileSize(filing.size)}</div>
-                    {is8K && (
-                      <div style={styles.filing8KBadge}>⚠ Exhibits</div>
-                    )}
                   </div>
-                );
-              })}
-            </div>
+                ))}
+              </div>
+            )}
 
             <button onClick={handleReset} style={styles.resetButton}>
               ← Ny sökning
@@ -372,55 +1018,21 @@ export default function CompanyPage() {
               </div>
             </div>
 
-            {/* Varning för 8-K */}
-            {is8KFiling(selectedFiling.form) && (
-              <div style={styles.warning8K}>
-                <div style={styles.warningIcon}>⚠️</div>
-                <div style={styles.warningContent}>
-                  <strong>8-K är inte optimal för promise extraction</strong>
-                  <p style={styles.warningText}>
-                    8-K filings innehåller ofta endast pressmeddelanden, exhibits (bilagor) 
-                    eller PDF-dokument utan strukturerad MD&A-text. Detta ger sällan 
-                    meningsfulla promises att analysera.
-                  </p>
-                  <p style={styles.warningRecommendation}>
-                    <strong>Rekommendation:</strong> Välj en{" "}
-                    <span style={styles.highlightGreen}>10-K</span> (årsredovisning) eller{" "}
-                    <span style={styles.highlightGreen}>10-Q</span> (kvartalsrapport) istället.
-                  </p>
-                </div>
-              </div>
-            )}
-
             <div style={styles.actionArea}>
-              {isSupportedForExtraction(selectedFiling.form) ? (
-                <>
-                  <button
-                    onClick={handleExtractPromises}
-                    disabled={loading}
-                    style={{...styles.button, ...styles.buttonLarge, ...(loading ? styles.buttonDisabled : {})}}
-                  >
-                    {loading ? "Extraherar..." : "🔍 Extrahera Promises"}
-                  </button>
-                  <p style={styles.actionHint}>
-                    Hämtar dokumentet, parsar sektioner och extraherar framåtblickande uttalanden.
-                  </p>
-                </>
-              ) : (
-                <>
-                  <button
-                    disabled
-                    style={{...styles.button, ...styles.buttonLarge, ...styles.buttonDisabled, backgroundColor: "var(--accent-orange)"}}
-                  >
-                    🚫 Extraction ej tillgänglig för {selectedFiling.form}
-                  </button>
-                  <p style={styles.actionHintWarning}>
-                    {is8KFiling(selectedFiling.form) 
-                      ? "8-K saknar ofta analysbart textinnehåll. Välj 10-K eller 10-Q istället."
-                      : `Form type "${selectedFiling.form}" stöds inte för promise extraction.`}
-                  </p>
-                </>
-              )}
+              <button
+                onClick={handleExtractPromises}
+                disabled={loading || !isSupportedForm(selectedFiling.form)}
+                style={{
+                  ...styles.button, 
+                  ...styles.buttonLarge, 
+                  ...(loading || !isSupportedForm(selectedFiling.form) ? styles.buttonDisabled : {})
+                }}
+              >
+                {loading ? "Extraherar..." : "🔍 Extrahera Promises"}
+              </button>
+              <p style={styles.actionHint}>
+                Hämtar dokumentet, parsar MD&A-sektionen och extraherar framåtblickande uttalanden.
+              </p>
             </div>
 
             <button onClick={() => setStep("filings")} style={styles.resetButton}>
@@ -430,70 +1042,515 @@ export default function CompanyPage() {
         )}
 
         {/* Step: Results */}
-        {step === "results" && extraction && (
+        {step === "results" && extractResponse && (
           <section style={styles.section}>
-            <div style={styles.resultsSummary}>
-              <h3 style={styles.sectionTitle}>Extraktionsresultat</h3>
-              
-              <div style={styles.statsGrid}>
-                <div style={styles.statCard}>
-                  <div style={styles.statValue}>{extraction.totalSentences}</div>
-                  <div style={styles.statLabel}>Meningar analyserade</div>
-                </div>
-                <div style={styles.statCard}>
-                  <div style={styles.statValue}>{extraction.extractedCount}</div>
-                  <div style={styles.statLabel}>Promises hittade</div>
-                </div>
-                <div style={styles.statCard}>
-                  <div style={styles.statValue}>{extraction.summary.byConfidence.high || 0}</div>
-                  <div style={styles.statLabel}>High confidence</div>
-                </div>
-              </div>
-
-              {savedToFirestore && (
-                <div style={styles.savedBadge}>✓ Sparad i Firestore</div>
-              )}
+            {/* Tab Navigation */}
+            <div style={styles.tabNav}>
+              <button
+                style={{
+                  ...styles.tabButton,
+                  ...(activeTab === "promises" ? styles.tabButtonActive : {}),
+                }}
+                onClick={() => setActiveTab("promises")}
+              >
+                📝 Promises ({extractResponse?.extraction?.extractedCount ?? 0})
+              </button>
+              <button
+                style={{
+                  ...styles.tabButton,
+                  ...(activeTab === "kpis" ? styles.tabButtonActive : {}),
+                }}
+                onClick={() => {
+                  setActiveTab("kpis");
+                  if (!kpiResponse && !kpiLoading) {
+                    handleFetchKpis();
+                  }
+                }}
+              >
+                📊 KPIs {kpiResponse ? `(${kpiResponse?.summary?.totalKpis ?? 0})` : ""}
+              </button>
             </div>
 
-            <div style={styles.categoryBreakdown}>
-              <h4 style={styles.subTitle}>Per kategori</h4>
-              <div style={styles.categoryGrid}>
-                {Object.entries(extraction.summary.byCategory)
-                  .filter(([, count]) => count > 0)
-                  .sort(([, a], [, b]) => b - a)
-                  .map(([category, count]) => (
-                    <div key={category} style={styles.categoryItem}>
-                      <span style={styles.categoryName}>{category}</span>
-                      <span style={styles.categoryCount}>{count}</span>
-                    </div>
-                  ))}
-              </div>
-            </div>
-
-            <div style={styles.promisesList}>
-              <h4 style={styles.subTitle}>Extraherade promises ({extraction.promises.length})</h4>
-              {extraction.promises.slice(0, 30).map((promise, idx) => (
-                <div key={idx} style={styles.promiseCard}>
-                  <div style={styles.promiseHeader}>
-                    <span style={styles.promiseConfidence}>
-                      {getConfidenceEmoji(promise.confidence)}
-                    </span>
-                    <span style={{...styles.promiseCategory, backgroundColor: getConfidenceColor(promise.confidence) + "20", color: getConfidenceColor(promise.confidence)}}>
-                      {promise.category}
-                    </span>
-                    <span style={styles.promiseSource}>{promise.source}</span>
+            {/* Promises Tab */}
+            {activeTab === "promises" && (
+              <>
+                <div style={styles.resultsSummary}>
+                  <h3 style={styles.sectionTitle}>Extraktionsresultat</h3>
+                  
+                  <div style={styles.metaInfo}>
+                    <span>📄 {extractResponse?.formType ?? "N/A"}</span>
+                    <span>📍 {extractResponse?.textSource ?? "N/A"}</span>
+                    <span>📝 {(extractResponse?.textLength ?? 0).toLocaleString()} tecken</span>
                   </div>
-                  <p style={styles.promiseText}>{promise.text}</p>
-                  {promise.keywords.length > 0 && (
-                    <div style={styles.promiseKeywords}>
-                      {promise.keywords.map((kw, i) => (
-                        <span key={i} style={styles.keywordTag}>{kw}</span>
-                      ))}
+
+                  <div style={styles.statsGrid}>
+                    <div style={styles.statCard}>
+                      <div style={styles.statValue}>{extractResponse?.extraction?.totalSentences ?? 0}</div>
+                      <div style={styles.statLabel}>Meningar</div>
+                    </div>
+                    <div style={styles.statCard}>
+                      <div style={styles.statValue}>{extractResponse?.extraction?.extractedCount ?? 0}</div>
+                      <div style={styles.statLabel}>Promises</div>
+                    </div>
+                    <div style={styles.statCard}>
+                      <div style={styles.statValue}>{extractResponse?.extraction?.summary?.byConfidence?.high ?? 0}</div>
+                      <div style={styles.statLabel}>High conf.</div>
+                    </div>
+                    <div style={styles.statCard}>
+                      <div style={styles.statValue}>{verificationResults.size}</div>
+                      <div style={styles.statLabel}>Verifierade</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div style={styles.filtersSection}>
+                  <h4 style={styles.subTitle}>Filter</h4>
+                  <div style={styles.filtersRow}>
+                    <div style={styles.filterGroup}>
+                      <label style={styles.filterLabel}>Typ</label>
+                      <select
+                        value={typeFilter}
+                        onChange={(e) => setTypeFilter(e.target.value as PromiseType | "ALL")}
+                        style={styles.select}
+                      >
+                        <option value="ALL">Alla typer</option>
+                        {(Object.keys(TYPE_LABELS) as PromiseType[]).map((type) => (
+                          <option key={type} value={type}>
+                            {TYPE_LABELS[type]} ({extractResponse?.extraction?.summary?.byType?.[type] || 0})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div style={styles.filterGroup}>
+                      <label style={styles.filterLabel}>Confidence</label>
+                      <select
+                        value={confidenceFilter}
+                        onChange={(e) => setConfidenceFilter(e.target.value as "high" | "medium" | "low" | "ALL")}
+                        style={styles.select}
+                      >
+                        <option value="ALL">Alla</option>
+                        <option value="high">🟢 High</option>
+                        <option value="medium">🟡 Medium</option>
+                        <option value="low">🔴 Low</option>
+                      </select>
+                    </div>
+
+                    <div style={styles.filterCount}>
+                      {filteredPromises.length} av {extractResponse?.extraction?.extractedCount ?? 0} promises
+                    </div>
+                  </div>
+                </div>
+
+                {/* Verification Details Panel */}
+                {selectedVerification && (
+                  <div style={styles.verificationPanel}>
+                    <div style={styles.verificationHeader}>
+                      <h4 style={styles.verificationTitle}>
+                        {STATUS_CONFIG[selectedVerification.result.status].emoji} Verifieringsdetaljer
+                      </h4>
+                      <button 
+                        onClick={() => setSelectedVerification(null)}
+                        style={styles.closeButton}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                    <div style={styles.verificationContent}>
+                      <div style={styles.verificationRow}>
+                        <span style={styles.verificationLabel}>Status:</span>
+                        <span style={{ color: STATUS_CONFIG[selectedVerification.result.status].color, fontWeight: 600 }}>
+                          {STATUS_CONFIG[selectedVerification.result.status].label}
+                        </span>
+                      </div>
+                      {selectedVerification.result.kpiUsed && (
+                        <div style={styles.verificationRow}>
+                          <span style={styles.verificationLabel}>KPI använd:</span>
+                          <span>{selectedVerification.result.kpiUsed.label}</span>
+                        </div>
+                      )}
+                      {selectedVerification.result.comparison.before && selectedVerification.result.comparison.after && (
+                        <div style={styles.comparisonGrid}>
+                          <div style={styles.comparisonCard}>
+                            <div style={styles.comparisonLabel}>Före ({selectedVerification.result.comparison.before.period})</div>
+                            <div style={styles.comparisonValue}>
+                              {formatKpiValue(selectedVerification.result.comparison.before.value, selectedVerification.result.comparison.before.unit)}
+                            </div>
+                          </div>
+                          <div style={styles.comparisonArrow}>→</div>
+                          <div style={styles.comparisonCard}>
+                            <div style={styles.comparisonLabel}>Efter ({selectedVerification.result.comparison.after.period})</div>
+                            <div style={styles.comparisonValue}>
+                              {formatKpiValue(selectedVerification.result.comparison.after.value, selectedVerification.result.comparison.after.unit)}
+                            </div>
+                          </div>
+                          {selectedVerification.result.comparison.deltaPct !== null && (
+                            <div style={{
+                              ...styles.deltaCard,
+                              backgroundColor: selectedVerification.result.comparison.deltaPct >= 0 
+                                ? "rgba(34, 197, 94, 0.1)" 
+                                : "rgba(239, 68, 68, 0.1)",
+                              color: selectedVerification.result.comparison.deltaPct >= 0 
+                                ? "var(--accent-green)" 
+                                : "var(--accent-red)",
+                            }}>
+                              <div style={styles.deltaLabel}>Δ%</div>
+                              <div style={styles.deltaValue}>
+                                {selectedVerification.result.comparison.deltaPct > 0 ? "+" : ""}
+                                {selectedVerification.result.comparison.deltaPct.toFixed(1)}%
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <div style={styles.verificationNotes}>
+                        <strong>Notering:</strong> {selectedVerification.result.notes}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Batch Verification Controls */}
+                {extractResponse && extractResponse.extraction.promises && extractResponse.extraction.promises.length > 0 && (
+                  <div style={{
+                    display: "flex",
+                    gap: "0.75rem",
+                    alignItems: "center",
+                    marginBottom: "1rem",
+                    padding: "0.75rem",
+                    backgroundColor: "var(--surface-secondary)",
+                    borderRadius: "0.5rem",
+                  }}>
+                    <button
+                      onClick={() => handleBatchVerify()}
+                      disabled={batchVerifying}
+                      style={{
+                        padding: "0.5rem 1rem",
+                        backgroundColor: batchVerifying ? "var(--text-muted)" : "var(--accent-blue)",
+                        color: "white",
+                        border: "none",
+                        borderRadius: "0.375rem",
+                        cursor: batchVerifying ? "not-allowed" : "pointer",
+                        fontWeight: 600,
+                        fontSize: "0.875rem",
+                      }}
+                    >
+                      {batchVerifying ? "Verifierar..." : "Verifiera alla (KPI)"}
+                    </button>
+                    <button
+                      onClick={() => handleBatchVerify(Array.from(selectedPromiseIndices))}
+                      disabled={batchVerifying || selectedPromiseIndices.size === 0}
+                      style={{
+                        padding: "0.5rem 1rem",
+                        backgroundColor: (batchVerifying || selectedPromiseIndices.size === 0) ? "var(--text-muted)" : "var(--accent-green)",
+                        color: "white",
+                        border: "none",
+                        borderRadius: "0.375rem",
+                        cursor: (batchVerifying || selectedPromiseIndices.size === 0) ? "not-allowed" : "pointer",
+                        fontWeight: 600,
+                        fontSize: "0.875rem",
+                      }}
+                    >
+                      {batchVerifying ? "Verifierar..." : `Verifiera valda (${selectedPromiseIndices.size})`}
+                    </button>
+                    <button
+                      onClick={handleSelectAllVerifiable}
+                      disabled={batchVerifying}
+                      style={{
+                        padding: "0.5rem 1rem",
+                        backgroundColor: "transparent",
+                        color: "var(--accent-blue)",
+                        border: "1px solid var(--accent-blue)",
+                        borderRadius: "0.375rem",
+                        cursor: batchVerifying ? "not-allowed" : "pointer",
+                        fontWeight: 600,
+                        fontSize: "0.875rem",
+                      }}
+                    >
+                      Välj alla
+                    </button>
+                    <button
+                      onClick={handleDeselectAll}
+                      disabled={batchVerifying}
+                      style={{
+                        padding: "0.5rem 1rem",
+                        backgroundColor: "transparent",
+                        color: "var(--text-muted)",
+                        border: "1px solid var(--text-muted)",
+                        borderRadius: "0.375rem",
+                        cursor: batchVerifying ? "not-allowed" : "pointer",
+                        fontWeight: 600,
+                        fontSize: "0.875rem",
+                      }}
+                    >
+                      Rensa val
+                    </button>
+                    {selectedPromiseIndices.size > 0 && (
+                      <span style={{ color: "var(--text-muted)", fontSize: "0.875rem" }}>
+                        {selectedPromiseIndices.size} valda
+                      </span>
+                    )}
+                  </div>
+                )}
+
+                <div style={styles.tableContainer}>
+                  <table style={styles.table}>
+                    <thead>
+                      <tr>
+                        <th style={{...styles.th, width: "40px"}}>
+                          <input
+                            type="checkbox"
+                            checked={
+                              (() => {
+                                if (!extractResponse?.extraction?.promises) return false;
+                                const verifiablePromises = extractResponse.extraction.promises.filter((p) => isVerifiableType(p.type));
+                                if (verifiablePromises.length === 0) return false;
+                                const verifiableIndices = extractResponse.extraction.promises
+                                  .map((p, idx) => ({ idx, promise: p }))
+                                  .filter(({ promise }) => isVerifiableType(promise.type))
+                                  .map(({ idx }) => idx);
+                                return verifiableIndices.every((idx) => selectedPromiseIndices.has(idx));
+                              })()
+                            }
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                handleSelectAllVerifiable();
+                              } else {
+                                handleDeselectAll();
+                              }
+                            }}
+                            disabled={batchVerifying}
+                            style={{ cursor: batchVerifying ? "not-allowed" : "pointer" }}
+                          />
+                        </th>
+                        <th style={styles.th}>Typ</th>
+                        <th style={styles.th}>Conf.</th>
+                        <th style={{...styles.th, width: "40%"}}>Claim</th>
+                        <th style={styles.th}>Verifiering</th>
+                        <th style={styles.th}>Åtgärd</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredPromises.map((promise, idx) => {
+                        const globalIndex = extractResponse?.extraction?.promises?.indexOf(promise) ?? -1;
+                        const verification = globalIndex >= 0 ? verificationResults.get(globalIndex) : undefined;
+                        const isVerifying = globalIndex >= 0 ? verifyingIndices.has(globalIndex) : false;
+                        const canVerify = isVerifiableType(promise.type);
+
+                        // Skip if globalIndex is invalid
+                        if (globalIndex < 0) {
+                          return null;
+                        }
+
+                        return (
+                          <tr key={idx} style={styles.tr}>
+                            <td style={styles.td}>
+                              {canVerify ? (
+                                <input
+                                  type="checkbox"
+                                  checked={selectedPromiseIndices.has(globalIndex)}
+                                  onChange={() => handleTogglePromiseSelection(globalIndex)}
+                                  disabled={batchVerifying || isVerifying}
+                                  style={{ cursor: (batchVerifying || isVerifying) ? "not-allowed" : "pointer" }}
+                                />
+                              ) : (
+                                <span style={{ color: "var(--text-muted)" }}>—</span>
+                              )}
+                            </td>
+                            <td style={styles.td}>
+                              <span style={{
+                                ...styles.typeBadge,
+                                backgroundColor: getTypeColor(promise.type) + "20",
+                                color: getTypeColor(promise.type),
+                              }}>
+                                {TYPE_LABELS[promise.type] || promise.type}
+                              </span>
+                            </td>
+                            <td style={styles.td}>
+                              <span style={{ color: getConfidenceColor(promise.confidence) }}>
+                                {getConfidenceBadge(promise.confidence)} {promise.confidenceScore ?? 0}
+                              </span>
+                            </td>
+                            <td style={styles.tdText}>
+                              <p style={styles.promiseText}>{promise.text || ""}</p>
+                              {promise.keywords && promise.keywords.length > 0 && (
+                                <div style={styles.keywordRow}>
+                                  {promise.keywords.slice(0, 3).map((kw, i) => (
+                                    <span key={i} style={styles.keywordTag}>{kw}</span>
+                                  ))}
+                                </div>
+                              )}
+                            </td>
+                            <td style={styles.td}>
+                              {verification ? (
+                                <div 
+                                  style={{ 
+                                    ...styles.verificationStatus, 
+                                    cursor: "pointer",
+                                    color: STATUS_CONFIG[verification.status]?.color || "var(--text-muted)"
+                                  }}
+                                  onClick={() => setSelectedVerification({ index: globalIndex, result: verification })}
+                                  title={
+                                    verification.status === "UNRESOLVED" 
+                                      ? `Varför kunde denna inte verifieras? ${verification.notes || "Klicka för detaljer"}`
+                                      : "Klicka för detaljer"
+                                  }
+                                >
+                                  <span>{STATUS_CONFIG[verification.status]?.emoji || "❓"}</span>
+                                  <span>{STATUS_CONFIG[verification.status]?.label || verification.status}</span>
+                                  {verification.comparison?.deltaPct !== null && verification.comparison?.deltaPct !== undefined && (
+                                    <span style={styles.deltaBadge}>
+                                      {verification.comparison.deltaPct > 0 ? "+" : ""}
+                                      {verification.comparison.deltaPct.toFixed(1)}%
+                                    </span>
+                                  )}
+                                  {verification.status === "UNRESOLVED" && (
+                                    <span style={{ fontSize: "0.7rem", marginLeft: "0.25rem", opacity: 0.7 }} title={verification.notes}>
+                                      ℹ️
+                                    </span>
+                                  )}
+                                </div>
+                              ) : (
+                                <span style={styles.notVerified}>—</span>
+                              )}
+                            </td>
+                            <td style={styles.td}>
+                              {canVerify ? (
+                                <button
+                                  onClick={() => handleVerifyPromise(globalIndex, promise)}
+                                  disabled={isVerifying || !!verification}
+                                  style={{
+                                    ...styles.verifyButton,
+                                    ...(isVerifying || verification ? styles.verifyButtonDisabled : {}),
+                                  }}
+                                >
+                                  {isVerifying ? "..." : verification ? "✓" : "Verifiera"}
+                                </button>
+                              ) : (
+                                <span style={styles.notVerifiable} title="Denna typ kan inte verifieras mot KPI">
+                                  N/A
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+
+                  {filteredPromises.length === 0 && (
+                    <div style={styles.emptyTable}>
+                      Inga promises matchar valda filter.
                     </div>
                   )}
                 </div>
-              ))}
-            </div>
+              </>
+            )}
+
+            {/* KPIs Tab */}
+            {activeTab === "kpis" && (
+              <div style={styles.kpiTabContent}>
+                {kpiLoading && (
+                  <div style={styles.loadingState}>
+                    <p>Hämtar KPI:er från SEC XBRL...</p>
+                  </div>
+                )}
+
+                {kpiError && (
+                  <div style={styles.kpiErrorBox}>
+                    <span>⚠</span> {kpiError}
+                  </div>
+                )}
+
+                {kpiResponse && (
+                  <>
+                    <div style={styles.kpiSummaryLarge}>
+                      <div style={styles.statCard}>
+                        <div style={styles.statValue}>{kpiResponse?.summary?.totalKpis ?? 0}</div>
+                        <div style={styles.statLabel}>Total KPIs</div>
+                      </div>
+                      <div style={styles.statCard}>
+                        <div style={styles.statValue}>{kpiResponse?.summary?.uniqueMetrics ?? 0}</div>
+                        <div style={styles.statLabel}>Unika metrics</div>
+                      </div>
+                      <div style={styles.statCard}>
+                        <div style={styles.statValue}>{kpiResponse?.summary?.coverageYears?.[0] ?? "N/A"}</div>
+                        <div style={styles.statLabel}>Senaste FY</div>
+                      </div>
+                    </div>
+
+                    <div style={styles.kpiFilterRow}>
+                      <select
+                        value={kpiFilter}
+                        onChange={(e) => setKpiFilter(e.target.value)}
+                        style={styles.select}
+                      >
+                        <option value="ALL">Alla KPIs</option>
+                        {uniqueKpiKeys.map((key) => (
+                          <option key={key} value={key}>
+                            {kpiResponse?.kpis?.find((k) => k?.key === key)?.label || key}
+                          </option>
+                        ))}
+                      </select>
+                      <span style={styles.kpiCount}>
+                        {filteredKpis.length} visas
+                      </span>
+                    </div>
+
+                    <div style={styles.kpiTableContainer}>
+                      <table style={styles.table}>
+                        <thead>
+                          <tr>
+                            <th style={styles.th}>KPI</th>
+                            <th style={styles.th}>Period</th>
+                            <th style={{...styles.th, textAlign: "right"}}>Värde</th>
+                            <th style={styles.th}>Form</th>
+                            <th style={styles.th}>Filed</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {filteredKpis.map((kpi, idx) => (
+                            <tr key={`${kpi.key}-${kpi.period}-${idx}`} style={styles.tr}>
+                              <td style={styles.td}>
+                                <span style={styles.kpiLabel}>{kpi.label}</span>
+                              </td>
+                              <td style={styles.td}>
+                                <span style={{
+                                  ...styles.periodBadge,
+                                  backgroundColor: kpi.periodType === "annual" 
+                                    ? "rgba(34, 197, 94, 0.15)" 
+                                    : "rgba(59, 130, 246, 0.15)",
+                                  color: kpi.periodType === "annual"
+                                    ? "var(--accent-green)"
+                                    : "var(--accent-blue)",
+                                }}>
+                                  {kpi.period}
+                                </span>
+                              </td>
+                              <td style={{...styles.td, textAlign: "right", fontFamily: "'JetBrains Mono', monospace"}}>
+                                {formatKpiValue(kpi.value, kpi.unit)}
+                              </td>
+                              <td style={styles.td}>
+                                <span style={styles.formBadge}>{kpi.form}</span>
+                              </td>
+                              <td style={{...styles.td, color: "var(--text-muted)", fontSize: "0.8rem"}}>
+                                {kpi.filedDate}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
+
+                {!kpiLoading && !kpiResponse && !kpiError && (
+                  <div style={styles.emptyState}>
+                    <p>Klicka på knappen ovan för att hämta KPI:er.</p>
+                  </div>
+                )}
+              </div>
+            )}
 
             <button onClick={handleReset} style={{...styles.button, ...styles.buttonLarge, marginTop: "2rem"}}>
               🔄 Ny analys
@@ -508,7 +1565,7 @@ export default function CompanyPage() {
             <a href="https://www.sec.gov/edgar" target="_blank" rel="noopener noreferrer">
               SEC EDGAR
             </a>{" "}
-            | Caching: 24h | Rate limit: 5 req/s
+            | KPI via XBRL | Promise Verification
           </p>
         </footer>
       </div>
@@ -526,7 +1583,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "2rem 1rem",
   },
   container: {
-    maxWidth: "1000px",
+    maxWidth: "1200px",
     margin: "0 auto",
   },
   header: {
@@ -559,6 +1616,15 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "0.25rem 0.5rem",
     fontSize: "0.7rem",
     fontWeight: 600,
+    backgroundColor: "var(--accent-green)",
+    color: "white",
+    borderRadius: "4px",
+    letterSpacing: "0.05em",
+  },
+  badgeVerify: {
+    padding: "0.25rem 0.5rem",
+    fontSize: "0.7rem",
+    fontWeight: 600,
     backgroundColor: "var(--accent-blue)",
     color: "white",
     borderRadius: "4px",
@@ -579,7 +1645,9 @@ const styles: Record<string, React.CSSProperties> = {
   progressStep: {
     padding: "0.5rem 1rem",
     backgroundColor: "var(--bg-secondary)",
-    border: "1px solid var(--border-color)",
+    borderWidth: "1px",
+    borderStyle: "solid",
+    borderColor: "var(--border-color)",
     borderRadius: "6px",
     fontSize: "0.8rem",
     color: "var(--text-muted)",
@@ -606,6 +1674,22 @@ const styles: Record<string, React.CSSProperties> = {
   },
   errorIcon: {
     fontSize: "1.2rem",
+  },
+  infoBox: {
+    display: "flex",
+    alignItems: "flex-start",
+    gap: "0.75rem",
+    padding: "1rem",
+    backgroundColor: "rgba(59, 130, 246, 0.08)",
+    border: "1px solid rgba(59, 130, 246, 0.2)",
+    borderRadius: "8px",
+    marginBottom: "1rem",
+    fontSize: "0.85rem",
+    color: "var(--text-secondary)",
+  },
+  infoIcon: {
+    fontSize: "1rem",
+    flexShrink: 0,
   },
   section: {
     backgroundColor: "var(--bg-secondary)",
@@ -649,12 +1733,15 @@ const styles: Record<string, React.CSSProperties> = {
     transition: "all 0.2s ease",
   },
   buttonDisabled: {
-    opacity: 0.6,
+    opacity: 0.5,
     cursor: "not-allowed",
   },
   buttonLarge: {
     padding: "1rem 2rem",
     fontSize: "1rem",
+  },
+  buttonKpi: {
+    backgroundColor: "var(--accent-purple)",
   },
   resetButton: {
     padding: "0.5rem 1rem",
@@ -723,50 +1810,35 @@ const styles: Record<string, React.CSSProperties> = {
     color: "white",
     borderRadius: "4px",
   },
+  emptyState: {
+    padding: "2rem",
+    textAlign: "center",
+    color: "var(--text-muted)",
+  },
+  loadingState: {
+    padding: "2rem",
+    textAlign: "center",
+    color: "var(--text-muted)",
+  },
   filingsGrid: {
     display: "grid",
-    gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))",
+    gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
     gap: "0.75rem",
     marginBottom: "1rem",
-  },
-  formTypeInfo: {
-    marginBottom: "1rem",
-    padding: "0.75rem 1rem",
-    backgroundColor: "rgba(59, 130, 246, 0.08)",
-    border: "1px solid rgba(59, 130, 246, 0.2)",
-    borderRadius: "8px",
-  },
-  formTypeHint: {
-    margin: 0,
-    fontSize: "0.85rem",
-    color: "var(--text-secondary)",
-    lineHeight: 1.5,
-  },
-  highlightGreen: {
-    color: "var(--accent-green)",
-    fontWeight: 600,
-  },
-  highlightOrange: {
-    color: "var(--accent-orange)",
-    fontWeight: 600,
   },
   filingCard: {
     padding: "1rem",
     backgroundColor: "var(--bg-primary)",
-    border: "1px solid var(--border-color)",
+    borderWidth: "2px",
+    borderStyle: "solid",
+    borderColor: "var(--border-color)",
     borderRadius: "8px",
     cursor: "pointer",
     textAlign: "center",
     transition: "all 0.2s ease",
-    position: "relative" as const,
-  },
-  filingCard8K: {
-    borderColor: "var(--accent-orange)",
-    backgroundColor: "rgba(251, 146, 60, 0.05)",
   },
   filingForm: {
     fontWeight: 700,
-    color: "var(--accent-blue)",
     fontSize: "1rem",
     marginBottom: "0.25rem",
   },
@@ -778,15 +1850,6 @@ const styles: Record<string, React.CSSProperties> = {
   filingSize: {
     fontSize: "0.7rem",
     color: "var(--text-muted)",
-  },
-  filing8KBadge: {
-    marginTop: "0.5rem",
-    padding: "0.2rem 0.5rem",
-    fontSize: "0.65rem",
-    fontWeight: 600,
-    color: "var(--accent-orange)",
-    backgroundColor: "rgba(251, 146, 60, 0.15)",
-    borderRadius: "4px",
   },
   extractPreview: {
     marginBottom: "1.5rem",
@@ -808,45 +1871,19 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--text-muted)",
     marginTop: "0.75rem",
   },
-  actionHintWarning: {
-    fontSize: "0.8rem",
-    color: "var(--accent-orange)",
-    marginTop: "0.75rem",
-    fontWeight: 500,
-  },
-  warning8K: {
-    display: "flex",
-    gap: "1rem",
-    padding: "1rem",
-    backgroundColor: "rgba(251, 146, 60, 0.1)",
-    border: "1px solid rgba(251, 146, 60, 0.3)",
-    borderRadius: "8px",
-    marginBottom: "1.5rem",
-  },
-  warningIcon: {
-    fontSize: "1.5rem",
-    flexShrink: 0,
-  },
-  warningContent: {
-    flex: 1,
-  },
-  warningText: {
-    margin: "0.5rem 0",
-    fontSize: "0.85rem",
-    color: "var(--text-secondary)",
-    lineHeight: 1.5,
-  },
-  warningRecommendation: {
-    margin: 0,
-    fontSize: "0.85rem",
-    color: "var(--text-primary)",
-  },
   resultsSummary: {
     marginBottom: "1.5rem",
   },
+  metaInfo: {
+    display: "flex",
+    gap: "1.5rem",
+    marginBottom: "1rem",
+    fontSize: "0.85rem",
+    color: "var(--text-muted)",
+  },
   statsGrid: {
     display: "grid",
-    gridTemplateColumns: "repeat(3, 1fr)",
+    gridTemplateColumns: "repeat(4, 1fr)",
     gap: "1rem",
     marginBottom: "1rem",
   },
@@ -867,86 +1904,108 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--text-muted)",
     marginTop: "0.25rem",
   },
-  savedBadge: {
-    display: "inline-block",
-    padding: "0.5rem 1rem",
-    backgroundColor: "rgba(34, 197, 94, 0.1)",
-    color: "var(--accent-green)",
-    borderRadius: "100px",
-    fontSize: "0.85rem",
-  },
-  categoryBreakdown: {
-    marginBottom: "1.5rem",
-  },
   subTitle: {
     fontSize: "0.9rem",
     fontWeight: 600,
     color: "var(--text-secondary)",
     marginBottom: "0.75rem",
   },
-  categoryGrid: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: "0.5rem",
-  },
-  categoryItem: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    padding: "0.375rem 0.75rem",
-    backgroundColor: "var(--bg-primary)",
-    border: "1px solid var(--border-color)",
-    borderRadius: "100px",
-    fontSize: "0.8rem",
-  },
-  categoryName: {
-    color: "var(--text-secondary)",
-    textTransform: "capitalize",
-  },
-  categoryCount: {
-    fontWeight: 600,
-    color: "var(--accent-blue)",
-  },
-  promisesList: {
-    maxHeight: "600px",
-    overflowY: "auto",
-  },
-  promiseCard: {
+  filtersSection: {
+    marginBottom: "1.5rem",
     padding: "1rem",
     backgroundColor: "var(--bg-primary)",
-    border: "1px solid var(--border-color)",
     borderRadius: "8px",
-    marginBottom: "0.75rem",
+    border: "1px solid var(--border-color)",
   },
-  promiseHeader: {
+  filtersRow: {
     display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    marginBottom: "0.5rem",
+    gap: "1.5rem",
+    alignItems: "flex-end",
     flexWrap: "wrap",
   },
-  promiseConfidence: {
-    fontSize: "1rem",
+  filterGroup: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.375rem",
   },
-  promiseCategory: {
+  filterLabel: {
+    fontSize: "0.75rem",
+    fontWeight: 600,
+    color: "var(--text-muted)",
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+  },
+  select: {
+    padding: "0.5rem 0.75rem",
+    fontSize: "0.85rem",
+    fontFamily: "inherit",
+    backgroundColor: "var(--bg-secondary)",
+    border: "1px solid var(--border-color)",
+    borderRadius: "6px",
+    color: "var(--text-primary)",
+    cursor: "pointer",
+    minWidth: "150px",
+  },
+  filterCount: {
+    fontSize: "0.85rem",
+    color: "var(--text-muted)",
+    marginLeft: "auto",
+  },
+  tableContainer: {
+    overflowX: "auto",
+    borderRadius: "8px",
+    border: "1px solid var(--border-color)",
+  },
+  kpiTableContainer: {
+    overflowX: "auto",
+    borderRadius: "8px",
+    border: "1px solid var(--border-color)",
+    maxHeight: "400px",
+    overflowY: "auto",
+  },
+  table: {
+    width: "100%",
+    borderCollapse: "collapse",
+    fontSize: "0.85rem",
+  },
+  th: {
+    padding: "0.75rem 1rem",
+    textAlign: "left",
+    fontWeight: 600,
+    color: "var(--text-secondary)",
+    backgroundColor: "var(--bg-primary)",
+    borderBottom: "1px solid var(--border-color)",
+    whiteSpace: "nowrap",
+    position: "sticky",
+    top: 0,
+  },
+  tr: {
+    borderBottom: "1px solid var(--border-color)",
+  },
+  td: {
+    padding: "0.75rem 1rem",
+    verticalAlign: "top",
+    whiteSpace: "nowrap",
+  },
+  tdText: {
+    padding: "0.75rem 1rem",
+    verticalAlign: "top",
+  },
+  typeBadge: {
+    display: "inline-block",
     padding: "0.25rem 0.5rem",
     fontSize: "0.7rem",
     fontWeight: 600,
     borderRadius: "4px",
-    textTransform: "uppercase",
-  },
-  promiseSource: {
-    fontSize: "0.7rem",
-    color: "var(--text-muted)",
-    marginLeft: "auto",
   },
   promiseText: {
-    fontSize: "0.9rem",
-    color: "var(--text-primary)",
-    lineHeight: 1.6,
     margin: 0,
+    lineHeight: 1.5,
+    color: "var(--text-primary)",
+    fontSize: "0.85rem",
+    maxWidth: "400px",
   },
-  promiseKeywords: {
+  keywordRow: {
     display: "flex",
     flexWrap: "wrap",
     gap: "0.25rem",
@@ -959,6 +2018,11 @@ const styles: Record<string, React.CSSProperties> = {
     color: "var(--text-muted)",
     borderRadius: "4px",
   },
+  emptyTable: {
+    padding: "2rem",
+    textAlign: "center",
+    color: "var(--text-muted)",
+  },
   footer: {
     marginTop: "2rem",
     paddingTop: "1.5rem",
@@ -967,5 +2031,235 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "0.8rem",
     color: "var(--text-muted)",
   },
+  kpiSection: {
+    marginBottom: "1.5rem",
+    padding: "1rem",
+    backgroundColor: "var(--bg-primary)",
+    borderRadius: "8px",
+    border: "1px solid var(--border-color)",
+  },
+  kpiDescription: {
+    fontSize: "0.85rem",
+    color: "var(--text-muted)",
+    marginBottom: "1rem",
+  },
+  kpiErrorBox: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.5rem",
+    padding: "0.75rem 1rem",
+    backgroundColor: "rgba(239, 68, 68, 0.1)",
+    border: "1px solid rgba(239, 68, 68, 0.3)",
+    borderRadius: "6px",
+    color: "var(--accent-red)",
+    marginTop: "1rem",
+    fontSize: "0.85rem",
+  },
+  kpiResults: {
+    marginTop: "1rem",
+  },
+  kpiSummary: {
+    display: "flex",
+    gap: "0.75rem",
+    padding: "0.75rem 1rem",
+    backgroundColor: "rgba(34, 197, 94, 0.1)",
+    borderRadius: "6px",
+    fontSize: "0.85rem",
+    color: "var(--accent-green)",
+    marginBottom: "1rem",
+  },
+  kpiSummaryLarge: {
+    display: "grid",
+    gridTemplateColumns: "repeat(3, 1fr)",
+    gap: "1rem",
+    marginBottom: "1.5rem",
+  },
+  kpiFilterRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "1rem",
+    marginBottom: "1rem",
+  },
+  kpiCount: {
+    fontSize: "0.85rem",
+    color: "var(--text-muted)",
+  },
+  kpiLabel: {
+    fontWeight: 500,
+    color: "var(--text-primary)",
+  },
+  periodBadge: {
+    display: "inline-block",
+    padding: "0.2rem 0.5rem",
+    fontSize: "0.75rem",
+    fontWeight: 600,
+    borderRadius: "4px",
+  },
+  formBadge: {
+    fontSize: "0.75rem",
+    color: "var(--text-muted)",
+  },
+  divider: {
+    border: "none",
+    borderTop: "1px solid var(--border-color)",
+    margin: "1.5rem 0",
+  },
+  tabNav: {
+    display: "flex",
+    gap: "0.5rem",
+    marginBottom: "1.5rem",
+    borderBottom: "1px solid var(--border-color)",
+    paddingBottom: "0.5rem",
+  },
+  tabButton: {
+    padding: "0.75rem 1.5rem",
+    fontSize: "0.9rem",
+    fontWeight: 500,
+    fontFamily: "inherit",
+    color: "var(--text-secondary)",
+    backgroundColor: "transparent",
+    border: "none",
+    borderRadius: "6px 6px 0 0",
+    cursor: "pointer",
+    transition: "all 0.2s ease",
+  },
+  tabButtonActive: {
+    color: "var(--accent-blue)",
+    backgroundColor: "var(--bg-primary)",
+    fontWeight: 600,
+  },
+  kpiTabContent: {
+    minHeight: "300px",
+  },
+  // Verification styles
+  verifyButton: {
+    padding: "0.375rem 0.75rem",
+    fontSize: "0.75rem",
+    fontWeight: 500,
+    fontFamily: "inherit",
+    color: "white",
+    backgroundColor: "var(--accent-purple)",
+    border: "none",
+    borderRadius: "4px",
+    cursor: "pointer",
+    transition: "all 0.2s ease",
+  },
+  verifyButtonDisabled: {
+    opacity: 0.5,
+    cursor: "not-allowed",
+    backgroundColor: "var(--text-muted)",
+  },
+  verificationStatus: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.375rem",
+    fontSize: "0.8rem",
+  },
+  deltaBadge: {
+    fontSize: "0.7rem",
+    fontWeight: 600,
+    fontFamily: "'JetBrains Mono', monospace",
+  },
+  notVerified: {
+    color: "var(--text-muted)",
+    fontSize: "0.8rem",
+  },
+  notVerifiable: {
+    color: "var(--text-muted)",
+    fontSize: "0.75rem",
+    fontStyle: "italic",
+  },
+  verificationPanel: {
+    marginBottom: "1.5rem",
+    padding: "1rem",
+    backgroundColor: "var(--bg-primary)",
+    border: "1px solid var(--accent-blue)",
+    borderRadius: "8px",
+  },
+  verificationHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: "1rem",
+  },
+  verificationTitle: {
+    fontSize: "0.95rem",
+    fontWeight: 600,
+    color: "var(--text-primary)",
+    margin: 0,
+  },
+  closeButton: {
+    padding: "0.25rem 0.5rem",
+    fontSize: "0.85rem",
+    fontFamily: "inherit",
+    color: "var(--text-muted)",
+    backgroundColor: "transparent",
+    border: "none",
+    borderRadius: "4px",
+    cursor: "pointer",
+  },
+  verificationContent: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.75rem",
+  },
+  verificationRow: {
+    display: "flex",
+    gap: "0.5rem",
+    fontSize: "0.85rem",
+  },
+  verificationLabel: {
+    color: "var(--text-muted)",
+    minWidth: "100px",
+  },
+  comparisonGrid: {
+    display: "flex",
+    alignItems: "center",
+    gap: "1rem",
+    padding: "0.75rem",
+    backgroundColor: "var(--bg-secondary)",
+    borderRadius: "6px",
+    flexWrap: "wrap",
+  },
+  comparisonCard: {
+    textAlign: "center",
+  },
+  comparisonLabel: {
+    fontSize: "0.7rem",
+    color: "var(--text-muted)",
+    marginBottom: "0.25rem",
+  },
+  comparisonValue: {
+    fontSize: "1rem",
+    fontWeight: 600,
+    fontFamily: "'JetBrains Mono', monospace",
+    color: "var(--text-primary)",
+  },
+  comparisonArrow: {
+    fontSize: "1.25rem",
+    color: "var(--text-muted)",
+  },
+  deltaCard: {
+    padding: "0.5rem 0.75rem",
+    borderRadius: "6px",
+    textAlign: "center",
+  },
+  deltaLabel: {
+    fontSize: "0.65rem",
+    fontWeight: 600,
+    marginBottom: "0.125rem",
+  },
+  deltaValue: {
+    fontSize: "1rem",
+    fontWeight: 700,
+    fontFamily: "'JetBrains Mono', monospace",
+  },
+  verificationNotes: {
+    fontSize: "0.85rem",
+    color: "var(--text-secondary)",
+    padding: "0.75rem",
+    backgroundColor: "var(--bg-secondary)",
+    borderRadius: "6px",
+    lineHeight: 1.5,
+  },
 };
-

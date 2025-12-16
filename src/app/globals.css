@@ -115,6 +115,12 @@ a:hover {
   animation: pulse 2s ease-in-out infinite;
 }
 
+/* Next.js portal styles */
+nextjs-portal {
+  left: 1px !important;
+  top: unset !important;
+}
+
 /* Utility classes */
 .loading-shimmer {
   background: linear-gradient(

@@ -384,6 +384,7 @@ export async function getCompanySubmissions(cik: string): Promise<SecCompanyInfo
 
 /**
  * Hämtar filings för ett bolag, filtrerat på form-typ.
+ * Filtrerar bort framtida filings (som ännu inte är publicerade på EDGAR).
  */
 export async function getCompanyFilings(
   cik: string,
@@ -395,14 +396,25 @@ export async function getCompanyFilings(
   const filings: FilingInfo[] = [];
   const formTypesUpper = formTypes.map(f => f.toUpperCase());
   
+  // Dagens datum för att filtrera bort framtida filings
+  const today = new Date();
+  today.setHours(23, 59, 59, 999); // Inkludera hela dagens filings
+  
   for (let i = 0; i < recent.form.length; i++) {
     const form = recent.form[i].toUpperCase();
+    const filingDate = recent.filingDate[i];
+    
+    // Filtrera bort framtida filings
+    const filingDateObj = new Date(filingDate);
+    if (filingDateObj > today) {
+      continue; // Hoppa över framtida filings
+    }
     
     if (formTypesUpper.includes(form)) {
       filings.push({
         accessionNumber: recent.accessionNumber[i],
-        filingDate: recent.filingDate[i],
-        reportDate: recent.reportDate[i] || recent.filingDate[i],
+        filingDate: filingDate,
+        reportDate: recent.reportDate[i] || filingDate,
         form: recent.form[i],
         primaryDocument: recent.primaryDocument[i],
         size: recent.size[i],
@@ -417,12 +429,14 @@ export async function getCompanyFilings(
 
 /**
  * Bygger bas-URL till ett filing-arkiv (utan dokumentnamn).
+ * OBS: Använder www.sec.gov (inte data.sec.gov) för Archives.
  */
 export function buildFilingArchiveUrl(cik: string, accessionNumber: string): string {
   const cikNoZeros = formatCikNoZeros(cik);
   const accessionNo = formatAccessionNoHyphens(accessionNumber);
   
-  return `${SEC_API.DATA}/Archives/edgar/data/${cikNoZeros}/${accessionNo}`;
+  // Använd www.sec.gov för Archives - data.sec.gov ger ofta 404
+  return `${SEC_API.WWW}/Archives/edgar/data/${cikNoZeros}/${accessionNo}`;
 }
 
 /**
@@ -571,13 +585,81 @@ export async function getFilingDocument(
   return result.content;
 }
 
+// ============================================
+// COMPANY FACTS (XBRL) - Cached 24h
+// ============================================
+
+const companyFactsCache = new Map<string, CacheEntry<CompanyFactsResponse>>();
+
+/**
+ * SEC Company Facts Response Type (förenklad)
+ */
+export interface CompanyFactsResponse {
+  cik: number;
+  entityName: string;
+  facts: {
+    "us-gaap"?: Record<string, FactData>;
+    "dei"?: Record<string, FactData>;
+    [key: string]: Record<string, FactData> | undefined;
+  };
+}
+
+export interface FactData {
+  label: string;
+  description: string;
+  units: Record<string, FactUnit[]>;
+}
+
+export interface FactUnit {
+  start?: string;
+  end: string;
+  val: number;
+  accn: string;
+  fy: number;
+  fp: string;
+  form: string;
+  filed: string;
+  frame?: string;
+}
+
 /**
  * Hämtar company facts (XBRL data) för ett företag.
+ * Cachas i 24 timmar.
+ * 
+ * @param cik - CIK-nummer (med eller utan ledande nollor)
+ * @returns CompanyFactsResponse med alla XBRL facts
+ */
+export async function fetchCompanyFacts(cik: string): Promise<CompanyFactsResponse> {
+  const paddedCik = formatCikPadded(cik);
+  
+  // Kolla cache
+  const cached = companyFactsCache.get(paddedCik);
+  if (isCacheValid(cached)) {
+    console.log(`[SEC] Using cached company facts for CIK ${paddedCik}`);
+    return cached.data;
+  }
+  
+  console.log(`[SEC] Fetching company facts for CIK ${paddedCik}...`);
+  const url = `${SEC_API.DATA}/api/xbrl/companyfacts/CIK${paddedCik}.json`;
+  const data = await fetchFromSec<CompanyFactsResponse>(url);
+  
+  // Cacha resultatet
+  companyFactsCache.set(paddedCik, {
+    data,
+    timestamp: Date.now(),
+  });
+  
+  console.log(`[SEC] Company facts cached for ${data.entityName}`);
+  return data;
+}
+
+/**
+ * Äldre funktion - behålls för bakåtkompatibilitet.
+ * Använd fetchCompanyFacts för typad respons.
  */
 export async function getCompanyFacts(cik: string): Promise<Record<string, unknown>> {
-  const paddedCik = formatCikPadded(cik);
-  const url = `${SEC_API.DATA}/api/xbrl/companyfacts/CIK${paddedCik}.json`;
-  return fetchFromSec<Record<string, unknown>>(url);
+  const result = await fetchCompanyFacts(cik);
+  return result as unknown as Record<string, unknown>;
 }
 
 /**

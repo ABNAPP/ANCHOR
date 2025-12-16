@@ -1,27 +1,29 @@
 /**
  * SEC Filing Parser
  * 
- * Parsar och extraherar sektioner från SEC filings (10-K, 10-Q, 8-K).
- * Hanterar både HTML och plain text format.
+ * Funktioner för att parsa och extrahera text från SEC EDGAR HTML-dokument.
+ * Fokuserar på att extrahera MD&A och Risk Factors från 10-K/10-Q filings.
  */
 
 // ============================================
 // TYPES
 // ============================================
 
-export interface FilingSection {
-  name: string;
-  title: string;
-  content: string;
-  startIndex: number;
-  endIndex: number;
+export interface ParsedSections {
+  mdna: string | null;           // Management's Discussion and Analysis
+  riskFactors: string | null;    // Risk Factors (Item 1A)
+  fullText: string;              // Hela dokumentet som fallback
+  metadata: {
+    totalLength: number;
+    mdnaLength: number;
+    riskFactorsLength: number;
+    sectionsFound: string[];
+  };
 }
 
 export interface ParsedFiling {
-  rawLength: number;
+  sections: ParsedSections;
   cleanedLength: number;
-  sections: FilingSection[];
-  fullText: string;
 }
 
 // ============================================
@@ -29,39 +31,29 @@ export interface ParsedFiling {
 // ============================================
 
 /**
- * Tar bort HTML-taggar och normaliserar whitespace.
+ * Tar bort HTML-taggar och rensar text för analys.
+ * 
+ * Steg:
+ * 1. Ta bort <script> och <style> block
+ * 2. Ta bort HTML-kommentarer
+ * 3. Ersätt HTML-entiteter
+ * 4. Ta bort alla HTML-taggar
+ * 5. Normalisera whitespace
+ * 6. Ta bort repetitiva "Table of Contents"-block
  */
-export function stripHtml(html: string): string {
+export function stripHtmlToText(html: string): string {
+  if (!html) return "";
+
   let text = html;
-  
-  // Ta bort script och style-block helt
+
+  // 1. Ta bort script och style block helt
   text = text.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, " ");
   text = text.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, " ");
   
-  // Ersätt block-element med radbrytningar
-  text = text.replace(/<\/(p|div|tr|li|h[1-6]|br|hr)>/gi, "\n");
-  text = text.replace(/<(br|hr)\s*\/?>/gi, "\n");
+  // 2. Ta bort HTML-kommentarer
+  text = text.replace(/<!--[\s\S]*?-->/g, " ");
   
-  // Ta bort alla andra HTML-taggar
-  text = text.replace(/<[^>]+>/g, " ");
-  
-  // Dekoda HTML-entiteter
-  text = decodeHtmlEntities(text);
-  
-  // Normalisera whitespace
-  text = text.replace(/[ \t]+/g, " ");
-  text = text.replace(/\n[ \t]+/g, "\n");
-  text = text.replace(/[ \t]+\n/g, "\n");
-  text = text.replace(/\n{3,}/g, "\n\n");
-  text = text.trim();
-  
-  return text;
-}
-
-/**
- * Dekoderar vanliga HTML-entiteter.
- */
-function decodeHtmlEntities(text: string): string {
+  // 3. Ersätt vanliga HTML-entiteter
   const entities: Record<string, string> = {
     "&nbsp;": " ",
     "&amp;": "&",
@@ -72,216 +64,297 @@ function decodeHtmlEntities(text: string): string {
     "&#39;": "'",
     "&mdash;": "—",
     "&ndash;": "–",
+    "&hellip;": "...",
+    "&bull;": "•",
+    "&trade;": "™",
+    "&reg;": "®",
+    "&copy;": "©",
     "&ldquo;": '"',
     "&rdquo;": '"',
     "&lsquo;": "'",
     "&rsquo;": "'",
-    "&bull;": "•",
-    "&hellip;": "...",
-    "&copy;": "©",
-    "&reg;": "®",
-    "&trade;": "™",
   };
   
-  let result = text;
   for (const [entity, replacement] of Object.entries(entities)) {
-    result = result.replace(new RegExp(entity, "gi"), replacement);
+    text = text.replace(new RegExp(entity, "gi"), replacement);
   }
   
-  // Numeriska entiteter
-  result = result.replace(/&#(\d+);/g, (_, code) => {
-    return String.fromCharCode(parseInt(code, 10));
+  // Hantera numeriska entiteter
+  text = text.replace(/&#(\d+);/g, (_, code) => {
+    const num = parseInt(code, 10);
+    return num < 65536 ? String.fromCharCode(num) : " ";
   });
-  result = result.replace(/&#x([0-9a-f]+);/gi, (_, code) => {
-    return String.fromCharCode(parseInt(code, 16));
+  text = text.replace(/&#x([0-9a-f]+);/gi, (_, code) => {
+    const num = parseInt(code, 16);
+    return num < 65536 ? String.fromCharCode(num) : " ";
   });
+
+  // 4. Ersätt block-element med radbrytningar för att bevara struktur
+  text = text.replace(/<\/(p|div|tr|li|h[1-6]|br|section|article)>/gi, "\n");
+  text = text.replace(/<br\s*\/?>/gi, "\n");
   
-  return result;
+  // 5. Ta bort alla återstående HTML-taggar
+  text = text.replace(/<[^>]+>/g, " ");
+
+  // 6. Normalisera whitespace
+  // - Ersätt tabs och multipla mellanslag med ett mellanslag
+  text = text.replace(/[ \t]+/g, " ");
+  // - Ersätt 3+ radbrytningar med 2
+  text = text.replace(/\n{3,}/g, "\n\n");
+  // - Trimma varje rad
+  text = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join("\n");
+
+  // 7. Ta bort repetitiva "Table of Contents"-block (heuristik)
+  // Dessa upprepas ofta i SEC filings
+  text = text.replace(/Table of Contents\s*\n/gi, "");
+  text = text.replace(/INDEX TO FINANCIAL STATEMENTS\s*\n/gi, "");
+  
+  // 8. Ta bort sidnummer och footer-text (heuristik)
+  text = text.replace(/^\d+\s*$/gm, ""); // Ensamma siffror på en rad
+  text = text.replace(/Page \d+ of \d+/gi, "");
+
+  return text.trim();
 }
-
-// ============================================
-// SECTION PATTERNS
-// ============================================
-
-const SECTION_PATTERNS_10K: Array<{ name: string; title: string; patterns: RegExp[] }> = [
-  {
-    name: "item1",
-    title: "Business",
-    patterns: [/item\s*1\.?\s*[-–—]?\s*business/i],
-  },
-  {
-    name: "item1a",
-    title: "Risk Factors",
-    patterns: [/item\s*1a\.?\s*[-–—]?\s*risk\s*factors/i],
-  },
-  {
-    name: "item7",
-    title: "Management's Discussion and Analysis (MD&A)",
-    patterns: [
-      /item\s*7\.?\s*[-–—]?\s*management['']?s?\s*discussion/i,
-      /management['']?s?\s*discussion\s*and\s*analysis/i,
-    ],
-  },
-  {
-    name: "item7a",
-    title: "Quantitative and Qualitative Disclosures About Market Risk",
-    patterns: [/item\s*7a\.?\s*[-–—]?\s*quantitative/i],
-  },
-  {
-    name: "item8",
-    title: "Financial Statements",
-    patterns: [/item\s*8\.?\s*[-–—]?\s*financial\s*statements/i],
-  },
-];
-
-const SECTION_PATTERNS_10Q: Array<{ name: string; title: string; patterns: RegExp[] }> = [
-  {
-    name: "part1_item1",
-    title: "Financial Statements",
-    patterns: [/item\s*1\.?\s*[-–—]?\s*financial\s*statements/i],
-  },
-  {
-    name: "part1_item2",
-    title: "Management's Discussion and Analysis (MD&A)",
-    patterns: [/item\s*2\.?\s*[-–—]?\s*management['']?s?\s*discussion/i],
-  },
-  {
-    name: "part2_item1a",
-    title: "Risk Factors",
-    patterns: [/item\s*1a\.?\s*[-–—]?\s*risk\s*factors/i],
-  },
-];
-
-const SECTION_PATTERNS_8K: Array<{ name: string; title: string; patterns: RegExp[] }> = [
-  { name: "item2_02", title: "Results of Operations", patterns: [/item\s*2\.02/i] },
-  { name: "item7_01", title: "Regulation FD Disclosure", patterns: [/item\s*7\.01/i] },
-  { name: "item8_01", title: "Other Events", patterns: [/item\s*8\.01/i] },
-];
 
 // ============================================
 // SECTION EXTRACTION
 // ============================================
 
-function findSections(
-  text: string, 
-  patterns: Array<{ name: string; title: string; patterns: RegExp[] }>
-): FilingSection[] {
-  const sections: FilingSection[] = [];
-  const matches: Array<{ name: string; title: string; index: number }> = [];
-  
-  for (const sectionDef of patterns) {
-    for (const pattern of sectionDef.patterns) {
-      const match = text.match(pattern);
-      if (match && match.index !== undefined) {
-        const existing = matches.find(m => m.name === sectionDef.name);
-        if (!existing || match.index < existing.index) {
-          if (existing) {
-            matches.splice(matches.indexOf(existing), 1);
-          }
-          matches.push({
-            name: sectionDef.name,
-            title: sectionDef.title,
-            index: match.index,
-          });
-        }
-        break;
-      }
-    }
-  }
-  
-  matches.sort((a, b) => a.index - b.index);
-  
-  for (let i = 0; i < matches.length; i++) {
-    const current = matches[i];
-    const next = matches[i + 1];
-    
-    const startIndex = current.index;
-    const endIndex = next ? next.index : text.length;
-    const content = text.substring(startIndex, endIndex).trim();
-    
-    if (content.length > 200) {
-      sections.push({
-        name: current.name,
-        title: current.title,
-        content,
-        startIndex,
-        endIndex,
-      });
-    }
-  }
-  
-  return sections;
-}
-
 /**
- * Parsar en SEC filing och extraherar sektioner.
+ * Extraherar specifika sektioner från en SEC filing.
+ * Prioriterar MD&A (Item 7 för 10-K, Item 2 för 10-Q) och Risk Factors (Item 1A).
  */
-export function parseFiling(rawContent: string, formType: string): ParsedFiling {
-  const cleanedText = stripHtml(rawContent);
+export function extractSections(text: string, formType: string): ParsedSections {
+  const sectionsFound: string[] = [];
   
-  let patterns: Array<{ name: string; title: string; patterns: RegExp[] }>;
-  const formUpper = formType.toUpperCase();
+  // Normalisera formType
+  const form = formType.toUpperCase();
+  const is10K = form.includes("10-K");
+  const is10Q = form.includes("10-Q");
+
+  let mdna: string | null = null;
+  let riskFactors: string | null = null;
+
+  // ============================================
+  // MD&A EXTRACTION
+  // ============================================
   
-  if (formUpper.includes("10-K")) {
-    patterns = SECTION_PATTERNS_10K;
-  } else if (formUpper.includes("10-Q")) {
-    patterns = SECTION_PATTERNS_10Q;
-  } else if (formUpper.includes("8-K")) {
-    patterns = SECTION_PATTERNS_8K;
+  // MD&A patterns - olika för 10-K och 10-Q
+  const mdnaPatterns = is10K
+    ? [
+        // 10-K: Item 7
+        /ITEM\s*7[.\s]*[-–—]?\s*MANAGEMENT['']?S?\s*DISCUSSION\s*AND\s*ANALYSIS/i,
+        /ITEM\s*7[.\s]*MANAGEMENT['']?S?\s*DISCUSSION/i,
+        /MANAGEMENT['']?S?\s*DISCUSSION\s*AND\s*ANALYSIS\s*OF\s*FINANCIAL\s*CONDITION/i,
+        /MD&A/i,
+      ]
+    : [
+        // 10-Q: Item 2
+        /ITEM\s*2[.\s]*[-–—]?\s*MANAGEMENT['']?S?\s*DISCUSSION\s*AND\s*ANALYSIS/i,
+        /ITEM\s*2[.\s]*MANAGEMENT['']?S?\s*DISCUSSION/i,
+        /MANAGEMENT['']?S?\s*DISCUSSION\s*AND\s*ANALYSIS/i,
+      ];
+
+  // MD&A end patterns
+  const mdnaEndPatterns = is10K
+    ? [
+        /ITEM\s*7A[.\s]*[-–—]?\s*QUANTITATIVE\s*AND\s*QUALITATIVE/i,
+        /ITEM\s*8[.\s]*[-–—]?\s*FINANCIAL\s*STATEMENTS/i,
+        /QUANTITATIVE\s*AND\s*QUALITATIVE\s*DISCLOSURES/i,
+      ]
+    : [
+        /ITEM\s*3[.\s]*[-–—]?\s*QUANTITATIVE\s*AND\s*QUALITATIVE/i,
+        /ITEM\s*4[.\s]*[-–—]?\s*CONTROLS\s*AND\s*PROCEDURES/i,
+        /QUANTITATIVE\s*AND\s*QUALITATIVE\s*DISCLOSURES/i,
+      ];
+
+  mdna = extractSectionBetween(text, mdnaPatterns, mdnaEndPatterns);
+  if (mdna && mdna.length > 500) {
+    sectionsFound.push("MD&A");
   } else {
-    patterns = [...SECTION_PATTERNS_10K, ...SECTION_PATTERNS_10Q];
+    mdna = null;
   }
+
+  // ============================================
+  // RISK FACTORS EXTRACTION (10-K primarily)
+  // ============================================
   
-  const sections = findSections(cleanedText, patterns);
-  
+  if (is10K) {
+    const riskPatterns = [
+      /ITEM\s*1A[.\s]*[-–—]?\s*RISK\s*FACTORS/i,
+      /RISK\s*FACTORS/i,
+    ];
+    
+    const riskEndPatterns = [
+      /ITEM\s*1B[.\s]*[-–—]?\s*UNRESOLVED\s*STAFF\s*COMMENTS/i,
+      /ITEM\s*2[.\s]*[-–—]?\s*PROPERTIES/i,
+      /UNRESOLVED\s*STAFF\s*COMMENTS/i,
+    ];
+
+    riskFactors = extractSectionBetween(text, riskPatterns, riskEndPatterns);
+    if (riskFactors && riskFactors.length > 500) {
+      sectionsFound.push("Risk Factors");
+    } else {
+      riskFactors = null;
+    }
+  }
+
   return {
-    rawLength: rawContent.length,
-    cleanedLength: cleanedText.length,
-    sections,
-    fullText: cleanedText,
+    mdna,
+    riskFactors,
+    fullText: text,
+    metadata: {
+      totalLength: text.length,
+      mdnaLength: mdna?.length || 0,
+      riskFactorsLength: riskFactors?.length || 0,
+      sectionsFound,
+    },
   };
 }
 
 /**
- * Extraherar MD&A-sektionen.
+ * Extraherar text mellan start- och slut-patterns.
  */
-export function extractMdaSection(parsedFiling: ParsedFiling): FilingSection | null {
-  return parsedFiling.sections.find(s => 
-    s.name === "item7" || 
-    s.name === "part1_item2" ||
-    s.title.toLowerCase().includes("management")
-  ) || null;
-}
+function extractSectionBetween(
+  text: string,
+  startPatterns: RegExp[],
+  endPatterns: RegExp[]
+): string | null {
+  let startIndex = -1;
+  let matchedStartPattern: RegExp | null = null;
 
-/**
- * Extraherar Risk Factors-sektionen.
- */
-export function extractRiskFactorsSection(parsedFiling: ParsedFiling): FilingSection | null {
-  return parsedFiling.sections.find(s =>
-    s.name === "item1a" ||
-    s.name === "part2_item1a" ||
-    s.title.toLowerCase().includes("risk factor")
-  ) || null;
-}
-
-/**
- * Delar upp text i meningar.
- */
-export function splitIntoSentences(text: string): string[] {
-  const sentences = text.split(/(?<=[.!?])\s+(?=[A-Z])/);
-  return sentences.filter(s => s.trim().length > 0);
-}
-
-/**
- * Trunkerar text till max längd.
- */
-export function truncateText(text: string, maxLength: number = 5000): string {
-  if (text.length <= maxLength) return text;
-  const truncated = text.substring(0, maxLength);
-  const lastPeriod = truncated.lastIndexOf(". ");
-  if (lastPeriod > maxLength * 0.8) {
-    return truncated.substring(0, lastPeriod + 1) + "...";
+  // Hitta första matchande start-pattern
+  for (const pattern of startPatterns) {
+    const match = text.match(pattern);
+    if (match && match.index !== undefined) {
+      if (startIndex === -1 || match.index < startIndex) {
+        startIndex = match.index;
+        matchedStartPattern = pattern;
+      }
+    }
   }
-  return truncated + "...";
+
+  if (startIndex === -1 || !matchedStartPattern) {
+    return null;
+  }
+
+  // Hitta första matchande slut-pattern efter start
+  let endIndex = text.length;
+  for (const pattern of endPatterns) {
+    const searchText = text.slice(startIndex + 100); // Sök efter startpositionen
+    const match = searchText.match(pattern);
+    if (match && match.index !== undefined) {
+      const absoluteIndex = startIndex + 100 + match.index;
+      if (absoluteIndex < endIndex) {
+        endIndex = absoluteIndex;
+      }
+    }
+  }
+
+  // Extrahera sektionen
+  const section = text.slice(startIndex, endIndex);
+  
+  // Rensa bort section-rubriken från början
+  const cleanedSection = section.replace(matchedStartPattern, "").trim();
+
+  return cleanedSection;
 }
 
+// ============================================
+// MAIN PARSER
+// ============================================
+
+/**
+ * Huvudfunktion för att parsa en SEC filing.
+ * 
+ * @param htmlContent - Raw HTML från SEC EDGAR
+ * @param formType - "10-K" eller "10-Q"
+ * @returns ParsedFiling med sektioner och metadata
+ */
+export function parseFiling(htmlContent: string, formType: string): ParsedFiling {
+  // 1. Rensa HTML till ren text
+  const cleanText = stripHtmlToText(htmlContent);
+  
+  // 2. Extrahera sektioner
+  const sections = extractSections(cleanText, formType);
+
+  console.log(`[Parse] Cleaned text: ${cleanText.length} chars`);
+  console.log(`[Parse] Sections found: ${sections.metadata.sectionsFound.join(", ") || "none"}`);
+  console.log(`[Parse] MD&A length: ${sections.metadata.mdnaLength}`);
+
+  return {
+    sections,
+    cleanedLength: cleanText.length,
+  };
+}
+
+/**
+ * Väljer bästa text för promise extraction.
+ * Prioriterar MD&A om den finns och är tillräckligt lång.
+ * 
+ * @param sections - ParsedSections från parseFiling
+ * @param minMdnaLength - Minsta längd för MD&A att användas (default 5000)
+ * @returns Bästa texten för analys och källan
+ */
+export function selectBestTextForAnalysis(
+  sections: ParsedSections,
+  minMdnaLength: number = 5000
+): { text: string; source: string } {
+  // Prioritet 1: MD&A om tillräckligt lång
+  if (sections.mdna && sections.mdna.length >= minMdnaLength) {
+    return {
+      text: sections.mdna,
+      source: "MD&A",
+    };
+  }
+
+  // Prioritet 2: Risk Factors som komplement
+  if (sections.riskFactors && sections.riskFactors.length >= minMdnaLength) {
+    return {
+      text: sections.riskFactors,
+      source: "Risk Factors",
+    };
+  }
+
+  // Prioritet 3: Kombinera MD&A + Risk Factors om båda finns men är korta
+  if (sections.mdna && sections.riskFactors) {
+    const combined = sections.mdna + "\n\n" + sections.riskFactors;
+    if (combined.length >= minMdnaLength) {
+      return {
+        text: combined,
+        source: "MD&A + Risk Factors",
+      };
+    }
+  }
+
+  // Fallback: Hela texten
+  return {
+    text: sections.fullText,
+    source: "Full Text",
+  };
+}
+
+/**
+ * Trunkerar text till en maxlängd med ellipsis.
+ */
+export function truncateText(text: string, maxLength: number): string {
+  if (!text || text.length <= maxLength) {
+    return text;
+  }
+  return text.slice(0, maxLength - 3) + "...";
+}
+
+/**
+ * Interface för en filing section (används av filing API route).
+ */
+export interface FilingSection {
+  name: string;
+  title: string;
+  content: string;
+  wordCount: number;
+  characterCount: number;
+}

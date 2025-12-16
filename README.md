@@ -14,12 +14,20 @@ En Next.js 14 applikation för real-time makroekonomisk analys och regime-detekt
 
 ### Company Engine (SEC EDGAR)
 - **Sök bolag** via ticker eller namn
-- **Hämta filings** (10-K, 10-Q, 8-K) från SEC EDGAR
+- **Hämta filings** (10-K, 10-Q) från SEC EDGAR
 - **Extrahera sektioner** (MD&A, Risk Factors, etc.)
-- **Promises/Claims extraction** (regelbaserad MVP)
+- **Promises/Claims extraction** (regelbaserad V2)
 - **Spara till Firestore** för analys över tid
 - **24h caching** för ticker-map och submissions
 - **Rate limiting** (max 5 req/sek till SEC)
+
+### KPI Engine (SEC XBRL)
+- **Hämta numeriska KPI:er** via SEC Company Facts API
+- **Stödda metrics:** Revenue, Net Income, EPS, Cash, Debt, Shares Outstanding, CFO, CapEx, FCF
+- **Automatisk beräkning** av Free Cash Flow (CFO - CapEx)
+- **Period-stöd:** Årliga (FY) och kvartals (Q1-Q4) värden
+- **24h caching** för Company Facts
+- **Helt gratis** - kräver bara SEC_USER_AGENT
 
 ### Gemensamt
 - **Responsivt dark-mode UI**
@@ -284,6 +292,78 @@ Projektet innehåller SEC-stöd i:
 - `src/lib/sec/client.ts` - SEC EDGAR API-klient (med caching och throttling)
 - `src/lib/sec/parse.ts` - HTML/text parsing och sektionsextraktion
 - `src/lib/company/promises.ts` - Regelbaserad promise/claims-extraktion
+- `src/lib/company/kpis.ts` - KPI-extraktion från XBRL Company Facts
+
+---
+
+## 📊 KPI via SEC XBRL Company Facts
+
+SEC erbjuder en **gratis API** för att hämta strukturerade finansiella data via XBRL Company Facts.
+
+### Endpoint
+
+```
+https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json
+```
+
+### Stödda KPIs
+
+| KPI | XBRL Tag | Beskrivning |
+|-----|----------|-------------|
+| Revenue | Revenues, SalesRevenueNet | Total omsättning |
+| Net Income | NetIncomeLoss | Nettoresultat |
+| Operating Income | OperatingIncomeLoss | Rörelseresultat |
+| EPS (Basic) | EarningsPerShareBasic | Vinst per aktie (basic) |
+| EPS (Diluted) | EarningsPerShareDiluted | Vinst per aktie (utspädd) |
+| Cash | CashAndCashEquivalentsAtCarryingValue | Kassa och likvida medel |
+| Debt | Debt, LongTermDebt | Total skuld |
+| Shares Outstanding | CommonStockSharesOutstanding | Utestående aktier |
+| CFO | NetCashProvidedByUsedInOperatingActivities | Kassaflöde från rörelsen |
+| CapEx | PaymentsToAcquirePropertyPlantAndEquipment | Kapitalinvesteringar |
+| Free Cash Flow | *Beräknad: CFO - CapEx* | Fritt kassaflöde |
+
+### API Route
+
+```
+GET /api/company/facts?cik=0000320193
+```
+
+**Response:**
+```json
+{
+  "cik": "0000320193",
+  "companyName": "Apple Inc.",
+  "asOf": "2024-01-15",
+  "kpis": [
+    {
+      "key": "revenue",
+      "label": "Revenue",
+      "period": "FY2024",
+      "periodType": "annual",
+      "value": 394328000000,
+      "unit": "USD",
+      "filedDate": "2024-11-01",
+      "fiscalYear": 2024,
+      "fiscalPeriod": "FY",
+      "form": "10-K"
+    }
+  ],
+  "summary": {
+    "totalKpis": 50,
+    "uniqueMetrics": 12,
+    "latestFilingDate": "2024-11-01",
+    "coverageYears": [2024, 2023, 2022]
+  }
+}
+```
+
+### Fördelar
+
+- ✅ **Helt gratis** - ingen API-nyckel krävs (bara User-Agent)
+- ✅ **Strukturerad data** - standardiserade XBRL-taggar
+- ✅ **Historiska värden** - flera år av data per metric
+- ✅ **Kvartals- och årsdata** - både 10-Q och 10-K perioder
+- ✅ **Automatisk beräkning** - FCF beräknas från CFO och CapEx
 
 ---
 
@@ -423,6 +503,154 @@ Vercel kommer automatiskt bygga och deploya vid varje push till `main`.
 - Verifiera nyckeln på [FRED API Dashboard](https://fred.stlouisfed.org/docs/api/api_key.html)
 - Skapa en ny nyckel om den gamla inte fungerar
 - Se till att kopiera hela nyckeln utan extra mellanslag
+
+---
+
+## 🔌 Felsökning: Connection Error i Cursor IDE
+
+### Problem
+
+Du får felmeddelandet:
+```
+Connection Error: Connection failed... check internet connection or VPN
+```
+
+När du använder **Resume**, **Apply**, **Agent**, eller annan AI-funktion i Cursor.
+
+> **OBS:** Detta är ett **miljö/nätverksproblem**, inte en bugg i koden.
+
+---
+
+### Checklista för Windows
+
+#### 1. VPN av/på
+- [ ] Stäng av VPN helt och testa
+- [ ] Om det fungerar utan VPN: prova VPN split-tunneling eller lägg till undantag för `cursor.so` och `*.cursor.sh`
+- [ ] Vissa företags-VPN:er blockerar okända endpoints
+
+#### 2. Byt nätverk
+- [ ] Prova mobilhotspot från telefonen
+- [ ] Prova ett annat Wi-Fi-nätverk
+- [ ] Prova kabelanslutning istället för Wi-Fi
+
+#### 3. Firewall / Antivirus-undantag
+- [ ] Lägg till Cursor i Windows Firewall undantag:
+  1. Sök "Windows Firewall" → "Allow an app through Windows Firewall"
+  2. Klicka "Allow another app..." → Bläddra till `C:\Users\<user>\AppData\Local\Programs\cursor\Cursor.exe`
+  3. Tillåt både privat och publikt nätverk
+- [ ] Lägg till undantag i antivirusprogram (t.ex. Windows Defender, Avast, Norton):
+  1. Öppna antivirusprogram → Inställningar → Undantag/Exclusions
+  2. Lägg till mapp: `C:\Users\<user>\AppData\Local\Programs\cursor\`
+  3. Lägg till process: `Cursor.exe`
+
+#### 4. Proxy-inställningar
+- [ ] Kontrollera Windows proxy:
+  1. Sök "Proxy settings" i Windows
+  2. Säkerställ "Use a proxy server" är **Av** (om du inte behöver proxy)
+  3. Om du har företagsproxy: se till att den tillåter `cursor.so`, `*.cursor.sh`, `api.anthropic.com`, `api.openai.com`
+- [ ] Kontrollera miljövariabler:
+  ```powershell
+  # I PowerShell:
+  $env:HTTP_PROXY
+  $env:HTTPS_PROXY
+  $env:NO_PROXY
+  ```
+  Om dessa är satta kan de störa Cursor. Prova tillfälligt:
+  ```powershell
+  $env:HTTP_PROXY = ""
+  $env:HTTPS_PROXY = ""
+  ```
+
+#### 5. DNS / Hosts
+- [ ] Prova byta DNS till Google (8.8.8.8) eller Cloudflare (1.1.1.1):
+  1. Kontrollpanelen → Nätverks- och delningscenter → Ändra adapaterinställningar
+  2. Högerklicka på din anslutning → Egenskaper
+  3. Välj "Internet Protocol Version 4" → Egenskaper
+  4. Välj "Använd följande DNS-serveradresser": 8.8.8.8 och 8.8.4.4
+- [ ] Kontrollera hosts-filen (`C:\Windows\System32\drivers\etc\hosts`) för blockeringar
+
+#### 6. Starta om
+- [ ] Starta om Cursor helt (File → Exit, inte bara stäng fönstret)
+- [ ] Starta om datorn
+- [ ] Rensa DNS-cache:
+  ```powershell
+  ipconfig /flushdns
+  ```
+
+---
+
+### Cursor-inställningar som kan påverka anslutningen
+
+Öppna Cursor Settings (`Ctrl+Shift+P` → "Preferences: Open Settings (UI)") eller editera `settings.json` (`Ctrl+Shift+P` → "Preferences: Open User Settings (JSON)").
+
+| Inställning | Sökväg i UI | JSON-nyckel | Beskrivning |
+|-------------|-------------|-------------|-------------|
+| **HTTP Proxy** | Search "proxy" → "Http: Proxy" | `"http.proxy"` | Proxy-URL för Cursor |
+| **Proxy Strict SSL** | Search "proxy" → "Http: Proxy Strict SSL" | `"http.proxyStrictSSL"` | Sätt till `false` om du har SSL-problem |
+| **Proxy Authorization** | Search "proxy" → "Http: Proxy Authorization" | `"http.proxyAuthorization"` | Om proxy kräver auth |
+| **Proxy Support** | Search "proxy" → "Http: Proxy Support" | `"http.proxySupport"` | `"on"` / `"off"` / `"override"` |
+| **System Certificates** | Search "certificate" | `"http.systemCertificates"` | Använd system-certifikat |
+| **AI: Enable** | Search "ai" | `"cursor.ai.enabled"` | Aktivera/avaktivera AI |
+| **Telemetry** | Search "telemetry" | `"telemetry.telemetryLevel"` | Kan påverka nätverksanrop |
+
+**Exempel på `settings.json` för proxy-problem:**
+
+```json
+{
+  "http.proxy": "",
+  "http.proxyStrictSSL": false,
+  "http.proxySupport": "override",
+  "http.systemCertificates": true
+}
+```
+
+**Cursor-specifika inställningar:**
+
+Cursor har även egna inställningar i:
+- `File → Preferences → Cursor Settings` (eller `Ctrl+Shift+J`)
+- Här kan du kontrollera:
+  - AI Provider (GPT-4, Claude, etc.)
+  - Privacy Mode
+  - Network-relaterade inställningar
+
+---
+
+### Snabbtest
+
+Kör följande i PowerShell för att testa om du kan nå Cursor:s endpoints:
+
+```powershell
+# Test Cursor API endpoints
+Test-NetConnection -ComputerName "cursor.so" -Port 443
+Test-NetConnection -ComputerName "api.cursor.sh" -Port 443
+
+# Test Anthropic (Claude)
+Test-NetConnection -ComputerName "api.anthropic.com" -Port 443
+
+# Test OpenAI
+Test-NetConnection -ComputerName "api.openai.com" -Port 443
+```
+
+Om något visar `TcpTestSucceeded: False` är den endpointen blockerad.
+
+---
+
+### Om inget fungerar
+
+1. **Kontrollera Cursor-status:**
+   - Besök [status.cursor.sh](https://status.cursor.sh) för aktuell status
+
+2. **Uppdatera Cursor:**
+   - Help → Check for Updates
+
+3. **Ominstallera Cursor:**
+   - Avinstallera via Windows Settings → Apps
+   - Ta bort mapp: `C:\Users\<user>\AppData\Roaming\Cursor` (sparar settings)
+   - Ladda ner senaste från [cursor.so](https://cursor.so)
+
+4. **Kontakta support:**
+   - [Cursor Discord](https://discord.gg/cursor)
+   - [Cursor Forum](https://forum.cursor.sh)
 
 ---
 

@@ -56,3 +56,71 @@ export interface MacroSnapshotSummary {
   };
 }
 
+// ============================================
+// PROMISE VERIFICATION
+// ============================================
+
+export type VerificationStatus = 
+  | "SUPPORTED"
+  | "CONTRADICTED"
+  | "UNRESOLVED"
+  | "PENDING";
+
+export type VerificationConfidence = "high" | "medium" | "low";
+
+export interface KpiComparisonData {
+  before: {
+    period: string;
+    value: number;
+    unit: string;
+    filedDate: string;
+  } | null;
+  after: {
+    period: string;
+    value: number;
+    unit: string;
+    filedDate: string;
+  } | null;
+  deltaAbs: number | null;
+  deltaPct: number | null;
+}
+
+export interface PromiseVerification {
+  createdAt: FieldValue | Timestamp;
+  company: {
+    cik10: string;
+    name: string;
+    ticker?: string;
+  };
+  promiseRef: {
+    promiseDocId?: string;
+    promiseIndex: number;
+    filingAccession: string;
+    filingDate: string;
+  };
+  promise: {
+    claim: string;
+    type: string;
+    timeHorizon: string;
+    measurable: boolean;
+    confidence: string;
+  };
+  kpiUsed: {
+    key: string;
+    label: string;
+  } | null;
+  comparison: KpiComparisonData;
+  status: VerificationStatus;
+  verificationConfidence: VerificationConfidence;
+  notes: string;
+  reasoning: string[];
+  source: {
+    method: "XBRL_FACTS";
+    asOf: string;
+  };
+}
+
+export interface PromiseVerificationWithId extends Omit<PromiseVerification, "createdAt"> {
+  id: string;
+  createdAt: string;
+}

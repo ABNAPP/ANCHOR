@@ -89,15 +89,47 @@ export async function GET(
     // Parsa dokumentet
     const parsed = parseFiling(fetchedDoc.content, form);
 
-    console.log(`[Filing] Parsed: ${parsed.sections.length} sections found`);
+    // Bygg section summaries från ParsedSections (objekt, inte array)
+    const sectionSummaries: FilingSectionSummary[] = [];
+    const fullSections: FilingSection[] = [];
+    
+    if (parsed.sections.mdna) {
+      const mdnaContent = parsed.sections.mdna;
+      const summary: FilingSectionSummary = {
+        name: "mdna",
+        title: "Management's Discussion and Analysis",
+        wordCount: mdnaContent.split(/\s+/).length,
+        characterCount: mdnaContent.length,
+      };
+      sectionSummaries.push(summary);
+      fullSections.push({
+        name: "mdna",
+        title: "Management's Discussion and Analysis",
+        content: mdnaContent,
+        wordCount: summary.wordCount,
+        characterCount: summary.characterCount,
+      });
+    }
+    
+    if (parsed.sections.riskFactors) {
+      const riskContent = parsed.sections.riskFactors;
+      const summary: FilingSectionSummary = {
+        name: "riskFactors",
+        title: "Risk Factors",
+        wordCount: riskContent.split(/\s+/).length,
+        characterCount: riskContent.length,
+      };
+      sectionSummaries.push(summary);
+      fullSections.push({
+        name: "riskFactors",
+        title: "Risk Factors",
+        content: riskContent,
+        wordCount: summary.wordCount,
+        characterCount: summary.characterCount,
+      });
+    }
 
-    // Bygg section summaries
-    const sectionSummaries: FilingSectionSummary[] = parsed.sections.map((s) => ({
-      name: s.name,
-      title: s.title,
-      wordCount: s.content.split(/\s+/).length,
-      characterCount: s.content.length,
-    }));
+    console.log(`[Filing] Parsed: ${sectionSummaries.length} sections found`);
 
     // Bygg response
     const response: FilingResponse = {
@@ -107,20 +139,20 @@ export async function GET(
       documentUrl: buildFilingDocumentUrl(cik, accession, doc), // Ursprunglig förfrågan
       sourceUrl: fetchedDoc.sourceUrl, // Faktisk källa
       usedFallback,
-      rawLength: parsed.rawLength,
+      rawLength: fetchedDoc.content.length,
       cleanedLength: parsed.cleanedLength,
-      sectionCount: parsed.sections.length,
+      sectionCount: sectionSummaries.length,
       sections: sectionSummaries,
     };
 
     // Inkludera textpreview om begärt (default: ja)
     if (includePreview) {
-      response.textPreview = truncateText(parsed.fullText, 2000);
+      response.textPreview = truncateText(parsed.sections.fullText, 2000);
     }
 
     // Inkludera fullständiga sektioner om begärt
     if (includeFull) {
-      response.fullSections = parsed.sections;
+      response.fullSections = fullSections;
     }
 
     return NextResponse.json(response);

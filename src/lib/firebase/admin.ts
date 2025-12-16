@@ -206,3 +206,13 @@ export function getFirestoreDb(): Firestore | null {
  * Collection-namn för macro snapshots
  */
 export const MACRO_SNAPSHOTS_COLLECTION = "macro_snapshots";
+
+/**
+ * Collection-namn för company promises
+ */
+export const COMPANY_PROMISES_COLLECTION = "company_promises";
+
+/**
+ * Collection-namn för promise verifications
+ */
+export const COMPANY_PROMISE_VERIFICATIONS_COLLECTION = "company_promise_verifications";

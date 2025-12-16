@@ -35,7 +35,7 @@ export async function GET(
   if (!cik) {
     return NextResponse.json(
       {
-        error: "Missing CIK",
+        error: "MISSING_CIK",
         message: "Ange CIK-nummer (parameter: cik)",
       },
       { status: 400 }
@@ -55,6 +55,16 @@ export async function GET(
     console.log(`[Company Filings] Found ${filings.length} filings`);
 
     return NextResponse.json({
+      ok: true,
+      data: {
+        cik: cik.padStart(10, "0"),
+        companyName: submissions.name,
+        tickers: submissions.tickers,
+        formTypes,
+        filingCount: filings.length,
+        filings,
+      },
+      // Bakåtkompatibilitet
       cik: cik.padStart(10, "0"),
       companyName: submissions.name,
       tickers: submissions.tickers,
@@ -71,7 +81,7 @@ export async function GET(
     if (message.includes("404")) {
       return NextResponse.json(
         {
-          error: "Company not found",
+          error: "COMPANY_NOT_FOUND",
           message: `Inget bolag hittades med CIK ${cik}`,
         },
         { status: 404 }
@@ -80,7 +90,7 @@ export async function GET(
 
     return NextResponse.json(
       {
-        error: "Filings fetch failed",
+        error: "FILINGS_FETCH_FAILED",
         message,
       },
       { status: 500 }
