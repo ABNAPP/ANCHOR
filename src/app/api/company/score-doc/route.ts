@@ -14,8 +14,9 @@
  *    - om verification finns, använd den
  *    - annars: skapa UNRESOLVED verification med neutral data
  *    - kör scorePromise()
- * 3) Uppdatera dokumentet med promise.score och companyScore (snitt av icke-UNCLEAR)
- * 4) Returnera { ok:true, data:{ companyScore, scoredCount, totalPromises } }
+ * 3) Beräkna company score baserat på verifierade promises
+ * 4) Uppdatera dokumentet med promise.score och companyScore
+ * 5) Returnera { ok:true, data:{ companyScore, scoredCount, totalPromises, breakdown } }
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -186,15 +187,37 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
             companyScore: null,
             scoredCount: 0,
             totalPromises: 0,
+            breakdown: { held: 0, mixed: 0, failed: 0, unclear: 0 },
             promises: [],
           },
         }
       );
     }
 
+    // Debug: Räkna promises med/s utan verification
+    const promisesWithVerification = promises.filter(p => p.verification && p.verification.kpiUsed).length;
+    const promisesWithoutVerification = promises.length - promisesWithVerification;
+    console.log(`[score] Promises with verification: ${promisesWithVerification}, without: ${promisesWithoutVerification}`);
+
+    // Debug: Räkna promise-typer
+    const promiseTypeCounts: Record<string, number> = {};
+    promises.forEach((p) => {
+      const type = p.type || "UNKNOWN";
+      promiseTypeCounts[type] = (promiseTypeCounts[type] || 0) + 1;
+    });
+    console.log(`[score] Promise types:`, promiseTypeCounts);
+
     // 4) Score varje promise
     console.log("[score] Starting to score promises...");
     const scoredPromises: StoredPromise[] = [];
+    
+    // Räkna statusar för debug
+    const scoreStatusCounts = {
+      HELD: 0,
+      MIXED: 0,
+      FAILED: 0,
+      UNCLEAR: 0,
+    };
     
     // Skapa en timestamp som används för alla promises i denna batch
     const scoringTimestamp = new Date().toISOString();
@@ -205,7 +228,19 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           const verification = p.verification ?? buildDefaultVerification();
           const promiseForVerification = mapPromiseForVerification(p);
 
+          // Debug: Logga om verification saknas eller har KPI
+          if (!p.verification) {
+            console.log(`[score] Promise ${idx} (${p.type}): No verification, using default UNRESOLVED`);
+          } else if (!p.verification.kpiUsed) {
+            console.log(`[score] Promise ${idx} (${p.type}): Verification exists but no KPI matched`);
+          } else {
+            console.log(`[score] Promise ${idx} (${p.type}): Verification with KPI ${p.verification.kpiUsed.key}`);
+          }
+
           const scoreResult = scorePromise(promiseForVerification, verification);
+          
+          // Räkna statusar
+          scoreStatusCounts[scoreResult.status]++;
 
           const scoredPromise = {
             ...p,
@@ -224,6 +259,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           const defaultVerification = buildDefaultVerification();
           const promiseForVerification = mapPromiseForVerification(p);
           const scoreResult = scorePromise(promiseForVerification, defaultVerification);
+          
+          scoreStatusCounts[scoreResult.status]++;
           
           scoredPromises.push({
             ...p,
@@ -251,12 +288,18 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
+    // Debug: Visa score-statusar
+    console.log(`[score] Score status breakdown:`, scoreStatusCounts);
+
     // 5) Beräkna company score baserat på verifierade promises
     const companyScoreResult = calculateCompanyScore(scoredPromises);
     const companyScore = companyScoreResult.companyScore;
     const scoredCount = companyScoreResult.scoredCount;
     
-    console.log(`[score] Scoring complete: companyScore=${companyScore}, scoredCount=${scoredCount}, breakdown:`, companyScoreResult.breakdown);
+    console.log(`[score] Company score calculation:`);
+    console.log(`[score]   companyScore: ${companyScore}`);
+    console.log(`[score]   scoredCount: ${scoredCount}`);
+    console.log(`[score]   breakdown:`, companyScoreResult.breakdown);
 
     // 6) Skriv tillbaka
     try {
@@ -282,7 +325,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // 6) Returnera resultat
+    // 7) Returnera resultat
     const responseData = {
       ok: true,
       data: {

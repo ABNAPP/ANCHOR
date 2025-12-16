@@ -782,6 +782,35 @@ export default function CompanyPage() {
         return newMap;
       });
 
+      // Uppdatera extractResponse med verifications så de finns lokalt
+      setExtractResponse((prev) => {
+        if (!prev) return prev;
+        const updatedPromises = prev.extraction.promises.map((p, idx) => {
+          const result = results.find((r: any) => r.promiseIndex === idx);
+          if (result) {
+            return {
+              ...p,
+              verification: {
+                status: result.status,
+                confidence: result.confidence,
+                kpiUsed: result.kpiUsed,
+                comparison: result.comparison,
+                notes: result.notes,
+                reasoning: result.reasoning || [],
+              },
+            };
+          }
+          return p;
+        });
+        return {
+          ...prev,
+          extraction: {
+            ...prev.extraction,
+            promises: updatedPromises,
+          },
+        };
+      });
+
       // Rensa valda promises
       setSelectedPromiseIndices(new Set());
     } catch (err) {

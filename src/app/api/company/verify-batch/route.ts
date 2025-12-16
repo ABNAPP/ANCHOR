@@ -13,7 +13,8 @@ import { PromiseType } from "@/lib/company/promises";
 import { 
   getFirestoreDb, 
   isFirebaseConfigured,
-  COMPANY_PROMISE_VERIFICATIONS_COLLECTION 
+  COMPANY_PROMISE_VERIFICATIONS_COLLECTION,
+  COMPANY_PROMISES_COLLECTION
 } from "@/lib/firebase/admin";
 import { PromiseVerification } from "@/lib/firebase/types";
 
@@ -168,13 +169,15 @@ function categorizeError(error: unknown): { httpStatus: number; errorCode: strin
 // ============================================
 
 export async function POST(request: NextRequest): Promise<NextResponse<BatchVerificationResponse | ErrorResponse>> {
+  console.log("[verify] POST /api/company/verify-batch - Starting");
+  
   let parsedBody: VerifyBatchRequestBody;
   
   // Steg 0: Parsa JSON body
   try {
     parsedBody = await request.json();
   } catch (parseError) {
-    console.error("[Verify Batch] Failed to parse request body:", parseError);
+    console.error("[verify] Failed to parse request body:", parseError);
     return NextResponse.json(
       {
         error: "INVALID_JSON",
@@ -227,6 +230,15 @@ export async function POST(request: NextRequest): Promise<NextResponse<BatchVeri
     );
   }
 
+  // Debug: Räkna promise-typer
+  const promiseTypeCounts: Record<string, number> = {};
+  promises.forEach((p) => {
+    const type = p.type || "UNKNOWN";
+    promiseTypeCounts[type] = (promiseTypeCounts[type] || 0) + 1;
+  });
+  console.log(`[verify] Promise types:`, promiseTypeCounts);
+  console.log(`[verify] Total promises: ${promises.length}`);
+
   // Bestäm vilka promises som ska verifieras
   let promisesToVerify: { index: number; promise: PromiseForVerification }[];
   
@@ -256,14 +268,16 @@ export async function POST(request: NextRequest): Promise<NextResponse<BatchVeri
     }));
   }
 
-  console.log(`[Verify Batch] Starting batch verification for CIK ${cik10}, ${promisesToVerify.length} promises`);
+  console.log(`[verify] Starting batch verification for CIK ${cik10}, ${promisesToVerify.length} promises to verify`);
 
   // 1. Hämta company facts (XBRL data) - en gång för alla
   let companyFacts;
   try {
+    console.log(`[verify] Fetching company facts for CIK ${cik10}...`);
     companyFacts = await fetchCompanyFacts(cik10);
+    console.log(`[verify] Company facts fetched successfully`);
   } catch (factError) {
-    console.error(`[Verify Batch] Failed to fetch company facts:`, factError);
+    console.error(`[verify] Failed to fetch company facts:`, factError);
     
     const { httpStatus, errorCode, userMessage, details } = categorizeError(factError);
     
@@ -280,10 +294,21 @@ export async function POST(request: NextRequest): Promise<NextResponse<BatchVeri
   // 2. Extrahera KPIs - en gång för alla
   let kpiResult;
   try {
+    console.log(`[verify] Extracting KPIs from company facts...`);
     kpiResult = extractKpisFromCompanyFacts(companyFacts);
-    console.log(`[Verify Batch] Extracted ${kpiResult.kpis.length} KPIs from company facts`);
+    console.log(`[verify] Extracted ${kpiResult.kpis.length} KPIs from company facts`);
+    
+    // Debug: Visa tillgängliga KPI-keys (top 20)
+    const kpiKeys = Array.from(new Set(kpiResult.kpis.map(k => k.key))).slice(0, 20);
+    console.log(`[verify] Available KPI keys (top 20):`, kpiKeys);
+    console.log(`[verify] KPI summary:`, {
+      totalKpis: kpiResult.kpis.length,
+      uniqueMetrics: kpiResult.summary.uniqueMetrics,
+      coverageYears: kpiResult.summary.coverageYears,
+      asOf: kpiResult.asOf,
+    });
   } catch (extractError) {
-    console.error(`[Verify Batch] Failed to extract KPIs:`, extractError);
+    console.error(`[verify] Failed to extract KPIs:`, extractError);
     return NextResponse.json(
       {
         error: "KPI_EXTRACTION_FAILED",
@@ -297,6 +322,15 @@ export async function POST(request: NextRequest): Promise<NextResponse<BatchVeri
   // 3. Verifiera varje promise
   const results: BatchVerificationResult[] = [];
   const db = getFirestoreDb();
+  
+  // Räkna statusar för debug
+  const statusCounts = {
+    SUPPORTED: 0,
+    CONTRADICTED: 0,
+    UNRESOLVED: 0,
+    PENDING: 0,
+  };
+  let matchedKpiCount = 0;
 
   for (const { index, promise } of promisesToVerify) {
     try {
@@ -311,6 +345,12 @@ export async function POST(request: NextRequest): Promise<NextResponse<BatchVeri
 
       // Kör verifiering
       const verificationResult = verifyPromiseWithKpis(promiseForVerification, kpiResult);
+      
+      // Räkna statusar
+      statusCounts[verificationResult.status]++;
+      if (verificationResult.kpiUsed) {
+        matchedKpiCount++;
+      }
       
       // Spara till Firestore (om konfigurerat) - ej kritiskt
       let verificationId: string | undefined;
@@ -356,7 +396,7 @@ export async function POST(request: NextRequest): Promise<NextResponse<BatchVeri
           verificationId = docRef.id;
         } catch (firestoreError) {
           // Firestore-fel är inte kritiskt - logga men fortsätt
-          console.warn(`[Verify Batch] Failed to save verification ${index} to Firestore:`, firestoreError);
+          console.warn(`[verify] Failed to save verification ${index} to Firestore:`, firestoreError);
         }
       }
 
@@ -371,7 +411,8 @@ export async function POST(request: NextRequest): Promise<NextResponse<BatchVeri
         verificationId,
       });
     } catch (verifyError) {
-      console.error(`[Verify Batch] Failed to verify promise ${index}:`, verifyError);
+      console.error(`[verify] Failed to verify promise ${index}:`, verifyError);
+      statusCounts.UNRESOLVED++;
       // Lägg till ett felsvar för denna promise
       results.push({
         promiseIndex: index,
@@ -390,9 +431,58 @@ export async function POST(request: NextRequest): Promise<NextResponse<BatchVeri
     }
   }
 
-  console.log(`[Verify Batch] Completed: ${results.length} promises verified`);
+  // Debug: Sammanfattning
+  console.log(`[verify] Verification complete:`);
+  console.log(`[verify]   Total promises: ${promisesToVerify.length}`);
+  console.log(`[verify]   Matched KPI: ${matchedKpiCount}`);
+  console.log(`[verify]   Status breakdown:`, statusCounts);
 
-  // 4. Returnera resultat
+  // 4. Uppdatera promises-arrayen i Firestore med verifications
+  if (db && promiseDocId) {
+    try {
+      console.log(`[verify] Updating promises in Firestore document ${promiseDocId}...`);
+      const docRef = db.collection(COMPANY_PROMISES_COLLECTION).doc(promiseDocId);
+      const docSnap = await docRef.get();
+      
+      if (docSnap.exists) {
+        const docData = docSnap.data();
+        const existingPromises = docData?.promises || [];
+        
+        // Uppdatera promises med verifications
+        const updatedPromises = existingPromises.map((p: any, idx: number) => {
+          const result = results.find(r => r.promiseIndex === idx);
+          if (result) {
+            return {
+              ...p,
+              verification: {
+                status: result.status,
+                confidence: result.confidence,
+                kpiUsed: result.kpiUsed,
+                comparison: result.comparison,
+                notes: result.notes,
+                reasoning: result.reasoning,
+              },
+            };
+          }
+          return p;
+        });
+        
+        await docRef.update({
+          promises: updatedPromises,
+          verificationUpdatedAt: FieldValue.serverTimestamp(),
+        });
+        
+        console.log(`[verify] Firestore document updated with ${results.length} verifications`);
+      } else {
+        console.warn(`[verify] Firestore document ${promiseDocId} not found - skipping update`);
+      }
+    } catch (updateError) {
+      console.error(`[verify] Failed to update Firestore document:`, updateError);
+      // Fortsätt ändå - verifications är sparade i separat collection
+    }
+  }
+
+  // 5. Returnera resultat
   return NextResponse.json({
     ok: true,
     data: {
@@ -408,4 +498,3 @@ export async function POST(request: NextRequest): Promise<NextResponse<BatchVeri
     },
   });
 }
-
