@@ -769,25 +769,51 @@ export default function CompanyPage() {
     setScoringLoading(true);
 
     try {
-      const res = await fetch("/api/company/score-doc", {
+      const endpoint = "/api/company/score-doc";
+      const requestBody = {
+        promiseDocId: extractResponse.firestoreId,
+      };
+
+      console.log("[score] Calling", endpoint, "with body:", requestBody);
+
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          promiseDocId: extractResponse.firestoreId,
-        }),
+        body: JSON.stringify(requestBody),
       });
 
-      const data = await res.json().catch(() => ({ ok: false, error: { message: "Failed to parse JSON response" } }));
+      // Läs text först för att hantera icke-JSON responses
+      const responseText = await res.text();
+      console.log("[score] Response status:", res.status, "Content-Type:", res.headers.get("content-type"));
 
-      if (!res.ok || !data.ok) {
-        const errorMsg = data.error?.message || data.message || "Scoring misslyckades";
-        const errorDetails = data.error?.details ? JSON.stringify(data.error.details, null, 2) : undefined;
+      let data: any;
+      try {
+        data = JSON.parse(responseText);
+      } catch (parseError) {
+        // Om JSON parse failar, visa texten i debug overlay
+        const errorMsg = `Failed to parse JSON response from ${endpoint} (HTTP ${res.status})`;
+        const errorDetails = `Response was not valid JSON:\n\n${responseText.substring(0, 500)}${responseText.length > 500 ? '...' : ''}`;
         addDebugError("score", new Error(errorMsg), res.status, errorDetails);
         return;
       }
 
+      // Hantera response
+      if (!res.ok || !data.ok) {
+        const errorCode = data.error?.code || "UNKNOWN_ERROR";
+        const errorMsg = data.error?.message || data.message || "Scoring misslyckades";
+        const errorDetails = data.error?.details 
+          ? `Code: ${errorCode}\nDetails: ${data.error.details}` 
+          : undefined;
+        
+        const fullErrorMsg = `${endpoint} returned ${res.status}: ${errorMsg}`;
+        addDebugError("score", new Error(fullErrorMsg), res.status, errorDetails);
+        return;
+      }
+
+      // Success
       const result = data.data;
       if (result) {
+        console.log("[score] Success:", result);
         setCompanyScore(result.companyScore ?? null);
         
         // Uppdatera promises med scores från response
@@ -814,7 +840,8 @@ export default function CompanyPage() {
         }
       }
     } catch (err) {
-      addDebugError("score", err);
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      addDebugError("score", new Error(`Network or unexpected error: ${errorMsg}`));
     } finally {
       setScoringLoading(false);
     }
