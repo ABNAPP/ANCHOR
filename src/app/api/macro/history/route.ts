@@ -3,44 +3,63 @@ import { Timestamp } from "firebase-admin/firestore";
 import { 
   getFirestoreDb, 
   isFirebaseConfigured, 
-  getFirebaseConfigError,
-  getMissingFirebaseEnvVars,
   MACRO_SNAPSHOTS_COLLECTION 
 } from "@/lib/firebase/admin";
 import { MacroSnapshotSummary } from "@/lib/firebase/types";
 
+// ============================================
+// PRODUCTION HARDENING: REQUEST ID
+// ============================================
+
+function generateRequestId(): string {
+  return `req_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+}
+
+// ============================================
+// CONSTANTS
+// ============================================
+
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
+// ============================================
+// MAIN API HANDLER
+// ============================================
+
 export async function GET(request: NextRequest): Promise<NextResponse> {
+  const requestId = generateRequestId();
+  console.log(`[history] Request ${requestId} started`);
+
   try {
-    // Kontrollera Firebase-konfiguration
+    // PRODUCTION HARDENING: Graceful Firebase degradation
+    // Om Firebase inte är konfigurerat → returnera 200 med tom array
     if (!isFirebaseConfigured()) {
-      const missingVars = getMissingFirebaseEnvVars();
-      return NextResponse.json(
-        {
-          error: "Firebase inte konfigurerat",
-          message: getFirebaseConfigError(),
-          missingEnvVars: missingVars,
-          hint: "Skapa .env.local med dessa variabler och starta om dev-servern.",
-        },
-        { status: 500 }
-      );
+      console.log(`[history] Firebase not configured for ${requestId}, returning empty array`);
+      return NextResponse.json({
+        count: 0,
+        limit: DEFAULT_LIMIT,
+        snapshots: [],
+        message: "Firebase inte konfigurerat. Historik är inte tillgänglig.",
+        firebaseEnabled: false,
+        requestId,
+      });
     }
 
     const db = getFirestoreDb();
     if (!db) {
-      return NextResponse.json(
-        {
-          error: "Kunde inte ansluta till Firestore",
-          message: "Firebase är konfigurerat men Firestore kunde inte initieras. Kontrollera att FIREBASE_PRIVATE_KEY är korrekt formaterad.",
-          hint: "Private key ska börja med '-----BEGIN PRIVATE KEY-----' och innehålla \\n för radbrytningar.",
-        },
-        { status: 500 }
-      );
+      // PRODUCTION: Firebase konfigurerat men kunde inte initieras → returnera 200 med tom array
+      console.log(`[history] Firestore not initialized for ${requestId}, returning empty array`);
+      return NextResponse.json({
+        count: 0,
+        limit: DEFAULT_LIMIT,
+        snapshots: [],
+        message: "Firestore kunde inte initieras. Historik är inte tillgänglig.",
+        firebaseEnabled: false,
+        requestId,
+      });
     }
 
-    // Hämta limit från query params
+    // PRODUCTION HARDENING: Input validation (säkra defaults)
     const searchParams = request.nextUrl.searchParams;
     let limit = parseInt(searchParams.get("limit") || String(DEFAULT_LIMIT), 10);
     
@@ -53,11 +72,26 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     }
 
     // Hämta snapshots från Firestore
-    const snapshot = await db
-      .collection(MACRO_SNAPSHOTS_COLLECTION)
-      .orderBy("createdAt", "desc")
-      .limit(limit)
-      .get();
+    // PRODUCTION: Try/catch-isolerat
+    let snapshot;
+    try {
+      snapshot = await db
+        .collection(MACRO_SNAPSHOTS_COLLECTION)
+        .orderBy("createdAt", "desc")
+        .limit(limit)
+        .get();
+    } catch (firestoreError) {
+      // PRODUCTION: Firestore-fel ska inte ge 500, returnera tom array
+      console.error(`[history] Firestore error for ${requestId}:`, firestoreError);
+      return NextResponse.json({
+        count: 0,
+        limit,
+        snapshots: [],
+        message: "Kunde inte hämta historik från Firestore.",
+        firebaseEnabled: true,
+        requestId,
+      });
+    }
 
     const summaries: MacroSnapshotSummary[] = [];
 
@@ -87,21 +121,28 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       });
     }
 
+    console.log(`[history] Request ${requestId} completed, returning ${summaries.length} snapshots`);
     return NextResponse.json({
       count: summaries.length,
       limit,
       snapshots: summaries,
+      firebaseEnabled: true,
+      requestId,
     });
   } catch (error) {
-    console.error("[History API] Error:", error);
+    // PRODUCTION: Alla oväntade fel ska ge tydligt felmeddelande
+    console.error(`[history] Unexpected error for ${requestId}:`, error);
     
     const errorMessage =
       error instanceof Error ? error.message : "Ett oväntat fel uppstod";
 
     return NextResponse.json(
       {
-        error: "Kunde inte hämta historik",
-        message: errorMessage,
+        error: true,
+        code: "INTERNAL_ERROR",
+        message: "Kunde inte hämta historik",
+        hint: errorMessage,
+        requestId,
       },
       { status: 500 }
     );

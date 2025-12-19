@@ -85,6 +85,7 @@ interface ErrorData {
   error: string;
   message: string;
   hint?: string;
+  requestId?: string;
 }
 
 type Status = "idle" | "loading" | "success" | "error";
@@ -110,10 +111,22 @@ export default function Home() {
       const response = await fetch("/api/macro/analyze");
       const result = await response.json();
 
-      if (!response.ok) {
-        setError(result as ErrorData);
+      // PRODUCTION HARDENING: Hantera standardiserad error-format
+      if (!response.ok || result.error === true) {
+        const errorData: ErrorData = {
+          error: result.code || "API_ERROR",
+          message: result.message || "Ett fel uppstod",
+          hint: result.hint,
+          requestId: result.requestId,
+        };
+        setError(errorData);
         setStatus("error");
         return;
+      }
+
+      // PRODUCTION HARDENING: Spara requestId för debugging
+      if (result.requestId) {
+        console.log(`[UI] Analysis completed, requestId: ${result.requestId}`);
       }
 
       setData(result as AnalyzeData);
@@ -292,12 +305,23 @@ export default function Home() {
             </div>
             <p style={styles.errorMessage}>{error.message}</p>
             {error.hint && <p style={styles.errorHint}>💡 {error.hint}</p>}
+            {error.requestId && (
+              <p style={{ fontSize: "0.75rem", color: "var(--text-secondary)", marginTop: "0.5rem" }}>
+                Request ID: {error.requestId}
+              </p>
+            )}
           </div>
         )}
 
         {/* Results */}
         {status === "success" && data && (
           <div style={styles.results} className="animate-fade-in">
+            {/* PRODUCTION HARDENING: Visa asOf datum */}
+            {data.asOf && (
+              <div style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginBottom: "1rem", textAlign: "right" }}>
+                Senast uppdaterad: {new Date(data.asOf).toLocaleDateString("sv-SE")}
+              </div>
+            )}
             {/* Regime Box */}
             <section style={styles.regimeSection}>
               <div
