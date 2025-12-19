@@ -2,7 +2,8 @@ import { FredSeriesResult } from "../fred/client";
 import { 
   getLatestValidValue, 
   calculateChangeFromNBack,
-  getLatestCommonDate 
+  getLatestCommonDate,
+  calculateYearOverYearChange
 } from "./align";
 
 export interface MacroFeatures {
@@ -11,6 +12,7 @@ export interface MacroFeatures {
   latestDates: Record<string, string | null>;
   chg20d: Record<string, number | null>;
   slope10y2y: number | null;
+  cpiStale?: boolean; // Flagga om CPI är stale (>45 dagar)
 }
 
 /**
@@ -19,7 +21,13 @@ export interface MacroFeatures {
  * Features:
  * - latest: Senaste värdet för varje serie
  * - chg20d: Förändring från 20 datapunkter bakåt (approximativt 20 handelsdagar)
+ *   EXCEPT för CPI som använder YoY (Year-over-Year)
  * - slope10y2y: DGS10 - DGS2 (yield curve slope)
+ * - cpiStale: true om CPI är äldre än 45 dagar
+ * 
+ * CONTRACT: Förändringsfönster per serie:
+ * - Dagliga serier (DGS10, DGS2, VIX, BAMLH0A0HYM2): 20 trading days
+ * - CPI (CPIAUCSL): YoY (Year-over-Year)
  */
 export function calculateFeatures(
   seriesMap: Map<string, FredSeriesResult>
@@ -28,14 +36,20 @@ export function calculateFeatures(
   const latestDates: Record<string, string | null> = {};
   const chg20d: Record<string, number | null> = {};
 
-  // Beräkna senaste värden och 20-dagars förändring för varje serie
+  // Beräkna senaste värden och förändring för varje serie
   for (const [seriesId, series] of seriesMap.entries()) {
     const latestVal = getLatestValidValue(series.observations);
     latest[seriesId] = latestVal?.value ?? null;
     latestDates[seriesId] = latestVal?.date ?? null;
 
-    // Beräkna 20-dagars förändring (20 datapunkter med giltiga värden)
-    chg20d[seriesId] = calculateChangeFromNBack(series.observations, 20);
+    // CONTRACT: CPI använder YoY, alla andra använder 20-dagars förändring
+    if (seriesId === "CPIAUCSL") {
+      // CPI: Year-over-Year förändring
+      chg20d[seriesId] = calculateYearOverYearChange(series.observations);
+    } else {
+      // Dagliga serier: 20-dagars förändring (20 datapunkter med giltiga värden)
+      chg20d[seriesId] = calculateChangeFromNBack(series.observations, 20);
+    }
   }
 
   // Beräkna yield curve slope (10Y - 2Y)
@@ -47,8 +61,8 @@ export function calculateFeatures(
     slope10y2y = dgs10 - dgs2;
   }
 
-  // Bestäm "asOf" datum
-  // Prioritera gemensamt datum, annars senaste datum från någon serie
+  // CONTRACT: asOf = senaste gemensamma datum där alla dagliga serier finns
+  // CPI tillåts vara stale
   let asOf = getLatestCommonDate(seriesMap);
   
   if (!asOf) {
@@ -61,12 +75,23 @@ export function calculateFeatures(
     }
   }
 
+  // CONTRACT: Flagga CPI som stale om äldre än 45 dagar
+  const cpiDate = latestDates["CPIAUCSL"];
+  let cpiStale = false;
+  if (cpiDate && asOf) {
+    const cpiDateObj = new Date(cpiDate);
+    const asOfDateObj = new Date(asOf);
+    const daysDiff = Math.floor((asOfDateObj.getTime() - cpiDateObj.getTime()) / (1000 * 60 * 60 * 24));
+    cpiStale = daysDiff > 45;
+  }
+
   return {
     asOf: asOf || new Date().toISOString().split("T")[0],
     latest,
     latestDates,
     chg20d,
     slope10y2y,
+    cpiStale,
   };
 }
 
@@ -90,4 +115,3 @@ export function formatChange(value: number | null, decimals: number = 2): string
   const prefix = value >= 0 ? "+" : "";
   return `${prefix}${value.toFixed(decimals)}`;
 }
-

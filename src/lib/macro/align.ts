@@ -154,3 +154,41 @@ export function alignSeriesToDate(
   return aligned;
 }
 
+/**
+ * Beräknar Year-over-Year (YoY) förändring för CPI
+ * 
+ * CONTRACT: CPI använder YoY istället för dagbaserade fönster
+ * 
+ * @param observations - CPI observations
+ * @returns YoY förändring i procent, eller null om data saknas
+ */
+export function calculateYearOverYearChange(
+  observations: FredObservation[]
+): number | null {
+  const latestVal = getLatestValidValue(observations);
+  if (!latestVal) {
+    return null;
+  }
+
+  // Hitta datum ett år tidigare (ungefär)
+  const latestDate = new Date(latestVal.date);
+  const oneYearAgo = new Date(latestDate);
+  oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+  const oneYearAgoStr = oneYearAgo.toISOString().split("T")[0];
+
+  // Hitta närmaste observation ett år tidigare
+  const yearAgoVal = getValueAtDate(observations, oneYearAgoStr);
+  
+  if (yearAgoVal === null) {
+    return null;
+  }
+
+  // Beräkna YoY förändring i procent
+  if (yearAgoVal === 0) {
+    return null; // Undvik division med noll
+  }
+
+  const yoyChange = ((latestVal.value - yearAgoVal) / yearAgoVal) * 100;
+  return yoyChange;
+}
+

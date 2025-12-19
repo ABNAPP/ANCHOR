@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { FieldValue } from "firebase-admin/firestore";
+import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { MVP_CONFIG } from "@/config/mvp";
 import { fetchMultipleFredSeries } from "@/lib/fred/client";
 import { calculateFeatures } from "@/lib/macro/features";
@@ -75,14 +75,86 @@ function setCache(key: string, data: AnalyzeResponse): void {
 }
 
 /**
+ * Hämtar senaste snapshot från Firestore
+ * Returnerar null om ingen snapshot finns eller om Firestore inte är konfigurerat
+ */
+async function getLatestSnapshot(): Promise<{ risk: string; createdAt: Timestamp } | null> {
+  try {
+    const db = getFirestoreDb();
+    if (!db) {
+      return null;
+    }
+
+    const snapshot = await db
+      .collection(MACRO_SNAPSHOTS_COLLECTION)
+      .orderBy("createdAt", "desc")
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return null;
+    }
+
+    const doc = snapshot.docs[0];
+    const data = doc.data();
+    return {
+      risk: data.regime?.risk || "neutral",
+      createdAt: data.createdAt as Timestamp,
+    };
+  } catch (error) {
+    console.error("[Firestore] Kunde inte hämta senaste snapshot:", error);
+    return null;
+  }
+}
+
+/**
+ * Kontrollerar om snapshot ska sparas enligt CONTRACT:
+ * - Sparas endast om regim ändrats ELLER om ingen snapshot sparats senaste 24h
+ */
+async function shouldSaveSnapshot(currentRisk: string): Promise<boolean> {
+  const latestSnapshot = await getLatestSnapshot();
+  
+  if (!latestSnapshot) {
+    // Ingen snapshot finns → spara alltid
+    return true;
+  }
+
+  // CONTRACT: Sparas om regim ändrats
+  if (latestSnapshot.risk !== currentRisk) {
+    console.log(`[Firestore] Regim ändrad: ${latestSnapshot.risk} → ${currentRisk}, sparar snapshot`);
+    return true;
+  }
+
+  // CONTRACT: Sparas om ingen snapshot sparats senaste 24h
+  const now = new Date();
+  const createdAt = latestSnapshot.createdAt.toDate();
+  const hoursSinceLastSnapshot = (now.getTime() - createdAt.getTime()) / (1000 * 60 * 60);
+  
+  if (hoursSinceLastSnapshot >= 24) {
+    console.log(`[Firestore] 24h passerat sedan senaste snapshot (${hoursSinceLastSnapshot.toFixed(1)}h), sparar snapshot`);
+    return true;
+  }
+
+  console.log(`[Firestore] Regim oförändrad (${currentRisk}) och <24h sedan senaste snapshot, hoppar över sparning`);
+  return false;
+}
+
+/**
  * Sparar en snapshot till Firestore
- * Returnerar document ID om lyckat, null om misslyckat
+ * CONTRACT: Sparas endast om regim ändrats ELLER om ingen snapshot sparats senaste 24h
+ * Returnerar document ID om lyckat, null om misslyckat eller hoppat över
  */
 async function saveSnapshotToFirestore(response: AnalyzeResponse): Promise<string | null> {
   try {
     const db = getFirestoreDb();
     if (!db) {
       console.warn("[Firestore] Inte konfigurerat - hoppar över snapshot-sparning");
+      return null;
+    }
+
+    // CONTRACT: Kontrollera om snapshot ska sparas
+    const shouldSave = await shouldSaveSnapshot(response.regime.risk);
+    if (!shouldSave) {
       return null;
     }
 
@@ -222,7 +294,8 @@ export async function GET(): Promise<NextResponse> {
     // Försök hämta från cache
     const cachedData = getFromCache(cacheKey);
     if (cachedData) {
-      // ÄVEN vid cache-hit, spara snapshot till Firestore (logg)
+      // CONTRACT: Även vid cache-hit, kontrollera om snapshot ska sparas
+      // (regim kan ha ändrats eller 24h kan ha passerat)
       saveAndCleanup(cachedData).catch((err) => {
         console.error("[Firestore] Save/cleanup failed:", err);
       });
